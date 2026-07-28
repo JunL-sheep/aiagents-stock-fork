@@ -42,14 +42,15 @@ class NewsFlowAgents:
         """检查AI是否可用"""
         return self.deepseek_client is not None
     
-    def sector_impact_agent(self, hot_topics: List[Dict], 
+    def sector_impact_agent(self, hot_topics: List[Dict],
                             stock_news: List[Dict],
-                            flow_data: Dict = None) -> Dict:
+                            flow_data: Dict = None,
+                            weighted_context: str = "") -> Dict:
         """
         板块影响分析代理
-        
+
         分析热点可能影响的板块
-        
+
         Returns:
             {
                 'affected_sectors': List[Dict],
@@ -59,18 +60,18 @@ class NewsFlowAgents:
         """
         if not self.is_available():
             return self._fallback_sector_analysis(hot_topics, stock_news)
-        
+
         # 准备数据
         topics_text = '\n'.join([
             f"- {t['topic']} (热度:{t.get('heat', 0)}, 跨{t.get('cross_platform', 0)}平台)"
             for t in hot_topics[:20]
         ])
-        
+
         news_text = '\n'.join([
             f"- [{n.get('platform_name', '')}] {n.get('title', '')}"
             for n in stock_news[:15]
         ])
-        
+
         flow_info = ""
         if flow_data:
             flow_info = f"""
@@ -80,7 +81,10 @@ class NewsFlowAgents:
 - 社交媒体热度: {flow_data.get('social_score', 'N/A')}
 - 财经平台热度: {flow_data.get('finance_score', 'N/A')}
 """
-        
+
+        # 4 层加权数据上下文 (T1-T4) - 来自股吧/板块映射
+        weighted_section = f"\n=== 4 层加权数据上下文 (T1 主流媒体 30% / T2 股吧情绪 30% / T3 跨平台共识 25% / T4 板块-个股映射 15%) ===\n{weighted_context}\n" if weighted_context else ""
+
         prompt = f"""你是一名资深的A股短线投资分析师，专注于热点题材挖掘和板块轮动分析。
 
 【重要】请根据以下全网热点数据，进行深度的A股题材分析：
@@ -91,13 +95,14 @@ class NewsFlowAgents:
 === 股票相关新闻TOP15 ===
 {news_text}
 {flow_info}
+{weighted_section}
 
 请完成以下分析任务：
 
 1. **题材挖掘**：从以上热点中挖掘出可能引爆A股的核心题材概念
 2. **板块分析**：分析最可能受益的A股板块（要具体到申万行业或同花顺概念板块）
-3. **热度评估**：评估每个板块的潜在炒作热度和持续性
-4. **龙头预判**：推测可能的龙头股特征
+3. **热度评估**：评估每个板块的潜在炒作热度和持续性（结合 T1-T4 加权数据）
+4. **龙头预判**：基于股吧关注度+排名上升，**点名具体股票代码**
 
 请以JSON格式输出：
 {{
@@ -156,10 +161,11 @@ class NewsFlowAgents:
     
     def stock_recommend_agent(self, hot_sectors: List[Dict],
                                flow_stage: str,
-                               sentiment_class: str) -> Dict:
+                               sentiment_class: str,
+                               weighted_context: str = "") -> Dict:
         """
         股票推荐代理
-        
+
         基于热门板块和市场状态推荐股票
         
         Returns:
@@ -181,13 +187,17 @@ class NewsFlowAgents:
         for s in hot_sectors[:5]:
             related_concepts.extend(s.get('related_concepts', []))
         concepts_text = ', '.join(list(set(related_concepts))[:10]) if related_concepts else '无'
-        
+
+        # 4 层加权数据上下文 (T1-T4)
+        weighted_section = f"\n=== 4 层加权数据 (T1 主流媒体 / T2 股吧情绪 / T3 跨平台共识 / T4 板块-个股映射) ===\n{weighted_context}\n" if weighted_context else ""
+
         prompt = f"""你是一名资深的A股短线游资操盘手，专注于热点题材龙头股挖掘。
 
 === 当前市场状态 ===
-- 流量阶段: {flow_stage} 
+- 流量阶段: {flow_stage}
 - 情绪状态: {sentiment_class}
 - 相关概念: {concepts_text}
+{weighted_section}
 
 === 热门受益板块分析 ===
 {sectors_text}
@@ -251,10 +261,11 @@ class NewsFlowAgents:
             logger.error(f"股票推荐失败: {e}")
             return self._fallback_stock_recommend(hot_sectors)
     
-    def risk_assess_agent(self, flow_stage: str, 
+    def risk_assess_agent(self, flow_stage: str,
                           sentiment_data: Dict,
                           viral_k: float,
-                          flow_type: str) -> Dict:
+                          flow_type: str,
+                          weighted_context: str = "") -> Dict:
         """
         风险评估代理
         
@@ -272,6 +283,9 @@ class NewsFlowAgents:
         if not self.is_available():
             return self._fallback_risk_assess(flow_stage, sentiment_data, viral_k)
         
+        # 4 层加权数据上下文
+        weighted_section = f"\n=== 4 层加权数据 (重点: 关注指数高 + 上升名次大 = 流量高潮逃命信号) ===\n{weighted_context}\n" if weighted_context else ""
+
         prompt = f"""你是一名专业的风险管理分析师。
 
 请根据以下市场数据评估当前投资风险：
@@ -282,6 +296,7 @@ class NewsFlowAgents:
 - 情绪分类: {sentiment_data.get('sentiment_class', '中性')}
 - K值(病毒系数): {viral_k}
 - 流量类型: {flow_type}
+{weighted_section}
 
 核心理念：
 - 流量高潮 = 价格高潮 = 逃命时刻
@@ -337,7 +352,8 @@ class NewsFlowAgents:
                                    stock_recommend: Dict,
                                    risk_assess: Dict,
                                    flow_data: Dict,
-                                   sentiment_data: Dict) -> Dict:
+                                   sentiment_data: Dict,
+                                   weighted_context: str = "") -> Dict:
         """
         投资建议代理（综合）
         
@@ -357,9 +373,12 @@ class NewsFlowAgents:
         
         # 构建综合信息
         sectors_text = ', '.join([s.get('name', '') for s in sector_analysis.get('benefited_sectors', [])[:3]])
-        stocks_text = ', '.join([f"{s.get('name', '')}({s.get('code', '')})" 
+        stocks_text = ', '.join([f"{s.get('name', '')}({s.get('code', '')})"
                                  for s in stock_recommend.get('recommended_stocks', [])[:3]])
-        
+
+        # 4 层加权数据上下文
+        weighted_section = f"\n=== 4 层加权数据 (T1 主流媒体 / T2 股吧情绪 / T3 跨平台共识 / T4 板块-个股映射) ===\n{weighted_context}\n" if weighted_context else ""
+
         prompt = f"""你是一名首席投资策略师，需要给出最终的投资建议。
 
 综合分析数据：
@@ -372,6 +391,7 @@ class NewsFlowAgents:
 - 情绪指数: {sentiment_data.get('sentiment_index', 50)}
 - 情绪分类: {sentiment_data.get('sentiment_class', '中性')}
 - 流量阶段: {sentiment_data.get('flow_stage', '未知')}
+{weighted_section}
 
 【板块分析】
 - 受益板块: {sectors_text}
@@ -451,10 +471,14 @@ class NewsFlowAgents:
                            flow_data: Dict,
                            sentiment_data: Dict,
                            viral_k: float = 1.0,
-                           flow_type: str = "未知") -> Dict:
+                           flow_type: str = "未知",
+                           target_codes: List[str] = None) -> Dict:
         """
         运行完整的AI分析
-        
+
+        Args:
+            target_codes: 智瞰龙虎推荐股代码列表，用于在 AI 提示中验证预测
+
         Returns:
             {
                 'sector_analysis': Dict,
@@ -466,13 +490,28 @@ class NewsFlowAgents:
             }
         """
         start_time = time.time()
-        
+
         logger.info("🤖 开始AI分析...")
-        
+
+        # 生成 4 层加权数据上下文 (T1-T4)，所有 agent 共享
+        weighted_context = ""
+        try:
+            from weighted_context import get_weighted_context
+            weighted_context = get_weighted_context(
+                top_n_attention=12,
+                top_n_rise=8,
+                top_n_concept=8,
+                target_codes=target_codes,
+            )
+            logger.info(f"  📊 4 层加权数据上下文已生成 ({len(weighted_context)} 字符)")
+        except Exception as e:
+            logger.warning(f"  ⚠️ weighted_context 生成失败: {e}")
+
         # 1. 板块影响分析
         logger.info("  📊 分析板块影响...")
-        sector_analysis = self.sector_impact_agent(hot_topics, stock_news, flow_data)
-        
+        sector_analysis = self.sector_impact_agent(hot_topics, stock_news, flow_data,
+                                                   weighted_context=weighted_context)
+
         # 2. 股票推荐
         logger.info("  📈 生成股票推荐...")
         flow_stage = sentiment_data.get('flow_stage', {}).get('stage_name', '未知')
@@ -480,18 +519,20 @@ class NewsFlowAgents:
         stock_recommend = self.stock_recommend_agent(
             sector_analysis.get('benefited_sectors', []),
             flow_stage,
-            sentiment_class
+            sentiment_class,
+            weighted_context=weighted_context,
         )
-        
+
         # 3. 风险评估
         logger.info("  ⚠️ 评估风险...")
         risk_assess = self.risk_assess_agent(
             flow_stage,
             sentiment_data.get('sentiment', {}),
             viral_k,
-            flow_type
+            flow_type,
+            weighted_context=weighted_context,
         )
-        
+
         # 4. 综合投资建议
         logger.info("  💡 生成投资建议...")
         investment_advice = self.investment_advisor_agent(
@@ -499,7 +540,8 @@ class NewsFlowAgents:
             stock_recommend,
             risk_assess,
             flow_data,
-            sentiment_data.get('sentiment', {})
+            sentiment_data.get('sentiment', {}),
+            weighted_context=weighted_context,
         )
         
         total_time = time.time() - start_time

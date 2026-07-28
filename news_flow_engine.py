@@ -177,9 +177,10 @@ class NewsFlowEngine:
             logger.error(f"❌ 快速分析失败: {e}")
             return {'success': False, 'error': str(e)}
     
-    def run_full_analysis(self, platforms: List[str] = None, 
+    def run_full_analysis(self, platforms: List[str] = None,
                           category: str = None,
-                          include_ai: bool = True) -> Dict:
+                          include_ai: bool = True,
+                          target_codes: List[str] = None) -> Dict:
         """
         运行完整分析（含AI）
         
@@ -227,6 +228,7 @@ class NewsFlowEngine:
                         sentiment_data,
                         viral_k=model_data.get('viral_k', {}).get('k_value', 1.0) if model_data else 1.0,
                         flow_type=model_data.get('flow_type', {}).get('flow_type', '未知') if model_data else '未知',
+                        target_codes=target_codes,
                     )
                     
                     # 多板块深度分析（多次调用DeepSeek）

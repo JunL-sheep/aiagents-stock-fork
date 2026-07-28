@@ -18,22 +18,46 @@ warnings.filterwarnings('ignore')
 
 class LonghubangDataFetcher:
     """龙虎榜数据获取类"""
-    
-    def __init__(self, api_key=None):
+
+    def __init__(self, api_key=None, use_akshare=None):
         """
         初始化数据获取器
-        
+
         Args:
             api_key: StockAPI的API密钥（可选，普通请求每日免费1000次）
+            use_akshare: 是否优先使用 AKShare 东方财富接口获取数据。
+                         - True: 优先 AKShare，失败后回退到 HTTP 接口
+                         - False: 直接走 HTTP 接口
+                         - None (默认): 读取环境变量 LONGHUBANG_USE_AKSHARE，
+                             未设置或为 "1"/"true" 时启用 AKShare；为 "0"/"false" 时关闭
         """
         print("[智瞰龙虎] 龙虎榜数据获取器初始化...")
+
+        # 数据源选择（默认走 AKShare，失败回退到原 HTTP 接口）
+        if use_akshare is None:
+            import os
+            env_val = os.environ.get('LONGHUBANG_USE_AKSHARE', '1').strip().lower()
+            use_akshare = env_val not in ('0', 'false', 'no', 'off')
+        self.use_akshare = use_akshare
+
+        # 原 HTTP 数据源（作为回退通道）
         # self.base_url = "https://api-lhb.zhongdu.net"
         self.base_url = "http://lhb-api.ws4.cn/v1"
-       # self.base_url = "https://www.stockapi.com.cn/v1"
+        # self.base_url = "https://www.stockapi.com.cn/v1"
         self.api_key = api_key
         self.max_retries = 3  # 最大重试次数
         self.retry_delay = 2  # 重试延迟（秒）
         self.request_delay = 0.025  # 请求间隔（秒），40次/秒 = 0.025秒/次
+
+        # 探测 AKShare 是否可用（避免未装时打满错误日志）
+        self._akshare_available = False
+        if self.use_akshare:
+            try:
+                import akshare as ak  # noqa: F401
+                self._akshare_available = True
+                print("[智瞰龙虎] AKShare 东方财富数据源: 已启用（失败时自动回退 HTTP）")
+            except ImportError:
+                print("[智瞰龙虎] AKShare 未安装，将直接走 HTTP 数据源")
     
     def _safe_request(self, url, params=None):
         """
@@ -73,26 +97,91 @@ class LonghubangDataFetcher:
         
         return None
     
+    def get_longhubang_data_akshare(self, date):
+        """
+        使用 AKShare 东方财富接口获取指定日期的龙虎榜（活跃营业部）数据。
+
+        与现有 schema 对齐，输出字段名沿用 yzmc/yyb/sblx/gpdm/gpmc/mrje/mcje/jlrje/rq/gl，
+        以便下游 parse_to_dataframe / analyze_data_summary / AI 分析师无需改动。
+
+        Args:
+            date: 日期，格式 YYYY-MM-DD
+
+        Returns:
+            dict: 形如 {'code': 20000, 'msg': 'success', 'data': [...]}；
+                  获取失败或当日无数据时返回 None。
+        """
+        if not self._akshare_available:
+            return None
+        try:
+            import akshare as ak
+            date_compact = date.replace('-', '')
+
+            # 优先用股票级接口（每行天然带 gpdm/gpmc，能让 longhubang_scoring
+            # 的 "按股票代码分组" 逻辑生效），用它当主数据源
+            df = ak.stock_lhb_detail_em(start_date=date_compact, end_date=date_compact)
+
+            if df is None or df.empty:
+                return None
+
+            records = []
+            for _, row in df.iterrows():
+                # 把"上榜原因"作为 yzmc 兼容（longhubang_agents/top_youzi 还在用）
+                # 把"解读"作为 yyb 占位（让机构共振等机构识别逻辑有机会命中关键词）
+                reason = str(row.get('上榜原因', '') or '').strip()
+                summary = str(row.get('解读', '') or '').strip()
+                record = {
+                    'yzmc': reason or '龙虎榜',          # 上榜原因作为游资/资金行为标签
+                    'yyb': summary or reason or '龙虎榜席位',
+                    'sblx': reason or '上榜',
+                    'gpdm': str(row.get('代码', '') or ''),     # ★ 关键：必须填股票代码
+                    'gpmc': str(row.get('名称', '') or ''),     # ★ 关键：必须填股票名称
+                    'mrje': str(row.get('龙虎榜买入额', 0) or 0),
+                    'mcje': str(row.get('龙虎榜卖出额', 0) or 0),
+                    'jlrje': str(row.get('龙虎榜净买额', 0) or 0),
+                    'rq': str(row.get('上榜日', date) or date),
+                    'gl': summary,                          # 解读作为概念字段
+                }
+                records.append(record)
+
+            print(f"    ✓ AKShare 东方财富接口返回 {len(records)} 条股票级记录")
+            return {'code': 20000, 'msg': 'success', 'data': records}
+        except Exception as e:
+            print(f"    AKShare 获取失败: {e}")
+            return None
+
     def get_longhubang_data(self, date):
         """
         获取指定日期的龙虎榜数据
-        
+
+        获取顺序：
+            1) AKShare 东方财富（默认，依赖 self.use_akshare）
+            2) 原 HTTP 接口（ws4.cn，作为回退通道，确保改动可逆）
+
         Args:
             date: 日期，格式为 YYYY-MM-DD，如 "2023-03-21"
-            
+
         Returns:
             dict: 龙虎榜数据
         """
         print(f"[智瞰龙虎] 获取 {date} 的龙虎榜数据...")
-        
+
+        # 1) 优先走 AKShare
+        if self.use_akshare and self._akshare_available:
+            result = self.get_longhubang_data_akshare(date)
+            if result and result.get('data'):
+                return result
+            print("    AKShare 未拿到数据，回退到 HTTP 接口...")
+
+        # 2) 回退到原 HTTP 接口（保持原有行为，便于一键切回）
         # url = f"{self.base_url}"
         url = f"{self.base_url}/youzi/all"
         params = {'date': date}
-        
+
         result = self._safe_request(url, params)
-        
+
         if result and result.get('data'):
-            print(f"    ✓ 成功获取 {len(result['data'])} 条龙虎榜记录")
+            print(f"    ✓ HTTP 成功获取 {len(result['data'])} 条龙虎榜记录")
             return result
         else:
             print(f"    ✗ 未获取到数据")

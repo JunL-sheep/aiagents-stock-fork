@@ -86,24 +86,91 @@ class NotificationService:
     def send_notification(self, notification: Dict) -> bool:
         """发送单个通知"""
         success = False
-        
+
         # 尝试webhook通知
         if self.config['webhook_enabled']:
             webhook_success = self._send_webhook_notification(notification)
             if webhook_success:
                 success = True
-        
+
         # 尝试邮件通知
         if self.config['email_enabled']:
             email_success = self._send_email_notification(notification)
             if email_success:
                 success = True
-        
+
         # 如果两者都未启用或都失败，使用界面通知作为备用
         if not success:
             self._show_streamlit_notification(notification)
             success = True
-        
+
+        return success
+
+    def send_analysis_result(self, subject: str, content: str) -> bool:
+        """
+        发送分析结果（带 subject 主题）
+        供 news_flow_alert 模块调用（板块级预警用）
+
+        Args:
+            subject: 消息主题（如"⚠️ 新闻流量危险预警"）
+            content: 消息正文（已格式化的多行文本）
+
+        Returns:
+            bool: 是否至少一个通道推送成功
+        """
+        success = False
+        keyword = self.config.get('webhook_keyword', '股票')
+
+        if self.config['webhook_enabled']:
+            try:
+                import requests
+                # 钉钉 markdown 格式
+                data = {
+                    'msgtype': 'markdown',
+                    'markdown': {
+                        'title': f"{keyword} - {subject}",
+                        'text': f"### {keyword} - {subject}\n\n{content}",
+                    }
+                }
+                r = requests.post(
+                    self.config['webhook_url'],
+                    json=data,
+                    headers={'Content-Type': 'application/json'},
+                    timeout=10
+                )
+                if r.status_code == 200:
+                    result = r.json()
+                    if result.get('errcode') == 0:
+                        success = True
+                    else:
+                        print(f"[Webhook] 发送失败: {result.get('errmsg')}")
+                else:
+                    print(f"[Webhook] HTTP {r.status_code}")
+            except Exception as e:
+                print(f"[Webhook] 异常: {e}")
+
+        if self.config['email_enabled']:
+            try:
+                import smtplib
+                from email.mime.text import MIMEText
+                from email.mime.multipart import MIMEMultipart
+                msg = MIMEMultipart()
+                msg['From'] = self.config['email_from']
+                msg['To'] = self.config['email_to']
+                msg['Subject'] = f"[{keyword}] {subject}"
+                msg.attach(MIMEText(content, 'plain', 'utf-8'))
+                if self.config['smtp_port'] == 465:
+                    server = smtplib.SMTP_SSL(self.config['smtp_server'], self.config['smtp_port'], timeout=15)
+                else:
+                    server = smtplib.SMTP(self.config['smtp_server'], self.config['smtp_port'], timeout=15)
+                    server.starttls()
+                server.login(self.config['email_from'], self.config['email_password'])
+                server.send_message(msg)
+                server.quit()
+                success = True
+            except Exception as e:
+                print(f"[Email] 异常: {e}")
+
         return success
     
     def _send_email_notification(self, notification: Dict) -> bool:

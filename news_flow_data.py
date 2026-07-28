@@ -22,37 +22,37 @@ class NewsFlowDataFetcher:
         self.base_url = "https://orz.ai/api/v1/dailynews/"
         self.timeout = 10
         
-        # 支持的平台配置 - 扩展到22个平台
+        # 支持的平台配置 - 18个 (2026-07 校对 orz.ai 实际支持列表)
+        # 已知问题：之前 9 个失败不是反爬，是配置错配
+        #   - 8 个平台名 API 根本不识别 (xiaohongshu/kuaishou/weixin/netease/ifeng/sina/wallstreetcn/sspai)
+        #   - 1 个名字错 (tskr → 实际叫 36kr)
+        # 修复：删 8 + 改 1 + 加 4 个 API 有但代码没用的高质量平台 (douban/hupu/v2ex/hackernews)
         self.platforms = {
-            # 社交媒体平台（核心流量指标）- 8个
+            # 社交媒体平台（核心流量指标）- 7个
             'weibo': {'name': '微博热搜', 'category': 'social', 'weight': 10, 'influence': 'high'},
             'douyin': {'name': '抖音热点', 'category': 'social', 'weight': 9, 'influence': 'high'},
             'zhihu': {'name': '知乎热榜', 'category': 'social', 'weight': 7, 'influence': 'medium'},
             'bilibili': {'name': '哔哩哔哩', 'category': 'social', 'weight': 6, 'influence': 'medium'},
-            'xiaohongshu': {'name': '小红书', 'category': 'social', 'weight': 7, 'influence': 'medium'},
-            'kuaishou': {'name': '快手', 'category': 'social', 'weight': 6, 'influence': 'medium'},
             'tieba': {'name': '百度贴吧', 'category': 'social', 'weight': 5, 'influence': 'low'},
-            'weixin': {'name': '微信热点', 'category': 'social', 'weight': 8, 'influence': 'high'},
-            
-            # 新闻媒体平台 - 6个
+            'douban': {'name': '豆瓣热门', 'category': 'social', 'weight': 5, 'influence': 'medium'},
+            'hupu': {'name': '虎扑', 'category': 'social', 'weight': 5, 'influence': 'medium'},
+
+            # 新闻媒体平台 - 3个 (从 6 个压缩；删 netease/ifeng/sina，API 都不支持)
             'baidu': {'name': '百度热搜', 'category': 'news', 'weight': 8, 'influence': 'high'},
             'jinritoutiao': {'name': '今日头条', 'category': 'news', 'weight': 7, 'influence': 'high'},
             'tenxunwang': {'name': '腾讯网', 'category': 'news', 'weight': 6, 'influence': 'medium'},
-            'netease': {'name': '网易新闻', 'category': 'news', 'weight': 6, 'influence': 'medium'},
-            'ifeng': {'name': '凤凰网', 'category': 'news', 'weight': 5, 'influence': 'medium'},
-            'sina': {'name': '新浪新闻', 'category': 'news', 'weight': 6, 'influence': 'medium'},
-            
-            # 财经平台（股市相关）- 5个
+
+            # 财经平台（股市相关）- 4个 (删 wallstreetcn，API 不支持)
             'sina_finance': {'name': '新浪财经', 'category': 'finance', 'weight': 9, 'influence': 'high'},
             'eastmoney': {'name': '东方财富', 'category': 'finance', 'weight': 9, 'influence': 'high'},
             'xueqiu': {'name': '雪球', 'category': 'finance', 'weight': 8, 'influence': 'high'},
             'cls': {'name': '财联社', 'category': 'finance', 'weight': 8, 'influence': 'high'},
-            'wallstreetcn': {'name': '华尔街见闻', 'category': 'finance', 'weight': 7, 'influence': 'medium'},
-            
-            # 科技平台 - 3个
-            'tskr': {'name': '36氪', 'category': 'tech', 'weight': 6, 'influence': 'medium'},
-            'sspai': {'name': '少数派', 'category': 'tech', 'weight': 5, 'influence': 'low'},
+
+            # 科技平台 - 4个 (tskr 改 36kr，删 sspai；加 v2ex/hackernews)
+            '36kr': {'name': '36氪', 'category': 'tech', 'weight': 6, 'influence': 'medium'},
             'juejin': {'name': '掘金', 'category': 'tech', 'weight': 5, 'influence': 'low'},
+            'v2ex': {'name': 'V2EX', 'category': 'tech', 'weight': 4, 'influence': 'low'},
+            'hackernews': {'name': 'Hacker News', 'category': 'tech', 'weight': 4, 'influence': 'low'},
         }
         
         # 平台类别权重（用于转化率计算）

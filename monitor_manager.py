@@ -129,7 +129,7 @@ def display_add_stock_section():
             
             # 监测参数
             st.markdown("**⏰ 监测参数**")
-            check_interval = st.slider("监测间隔(分钟)", 5, 120, 30)
+            check_interval = st.slider("监测间隔(分钟)", 1, 60, 1, help="默认 1 分钟配合 60s 主循环做近实时监测；监测股票较多时建议调到 5+ 分钟避免 API 限流")
             notification_enabled = st.checkbox("启用通知", value=True)
             
             # 投资评级
@@ -305,27 +305,53 @@ def display_stock_card(stock: Dict):
         
         # 监测状态
         st.markdown("**📊 监测状态**")
-        col1, col2, col3 = st.columns(3)
-        
+        col1, col2, col3, col4 = st.columns(4)
+
         with col1:
             st.caption(f"监测间隔: {stock['check_interval']}分钟")
-        
+
         with col2:
             if stock['last_checked']:
                 last_checked = datetime.fromisoformat(stock['last_checked'])
                 st.caption(f"最后检查: {last_checked.strftime('%m-%d %H:%M')}")
             else:
                 st.caption("最后检查: 从未检查")
-        
+
         with col3:
             status = "🟢 启用" if stock['notification_enabled'] else "🔴 禁用"
             st.caption(f"通知: {status}")
-            
+
             # 显示量化状态
             if stock.get('quant_enabled', False):
                 st.caption("🤖 量化: 🟢 启用")
             else:
                 st.caption("🤖 量化: 🔴 禁用")
+
+        with col4:
+            # 剩余观察天数（TTL）
+            expires_at = stock.get('expires_at')
+            if expires_at:
+                try:
+                    exp_dt = datetime.fromisoformat(expires_at)
+                    days_left = (exp_dt - datetime.now()).days
+                    if days_left > 3:
+                        ttl_emoji = "🟢"
+                        ttl_text = f"还剩 {days_left} 天"
+                    elif days_left >= 1:
+                        ttl_emoji = "🟡"
+                        ttl_text = f"还剩 {days_left} 天"
+                    elif days_left == 0:
+                        ttl_emoji = "🟠"
+                        ttl_text = "今日到期"
+                    else:
+                        ttl_emoji = "🔴"
+                        ttl_text = "已过期"
+                    st.caption(f"⏳ {ttl_emoji} {ttl_text}")
+                    st.caption(f"至 {exp_dt.strftime('%m-%d')}")
+                except (ValueError, TypeError):
+                    st.caption("⏳ TTL: 未知")
+            else:
+                st.caption("⏳ TTL: 未设置")
         
         # 操作按钮
         st.markdown("**🔧 操作**")
@@ -389,7 +415,7 @@ def display_edit_dialog(stock_id: int):
         
         with col2:
             st.subheader("⚙️ 监测设置")
-            check_interval = st.slider("监测间隔(分钟)", 5, 120, stock['check_interval'])
+            check_interval = st.slider("监测间隔(分钟)", 1, 60, max(1, stock['check_interval']), help="默认 1 分钟配合 60s 主循环做近实时监测；监测股票较多时建议调到 5+ 分钟避免 API 限流")
             rating = st.selectbox("投资评级", ["买入", "持有", "卖出"], 
                                  index=["买入", "持有", "卖出"].index(stock['rating']) if stock['rating'] in ["买入", "持有", "卖出"] else 0)
             notification_enabled = st.checkbox("启用通知", value=stock['notification_enabled'])
