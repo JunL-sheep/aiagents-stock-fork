@@ -55,8 +55,6 @@ DEEPSEEK_API_KEY=your_key_here        # DeepSeek API密钥（核心AI引擎）
 
 # ===== 数据源（可选）=====
 TUSHARE_TOKEN=your_token_here          # Tushare Token（https://tushare.pro）
-YDC_API_KEY=your_ydc_api_key_here     # You.com API密钥（智策板块Research功能用）
-YDC_RESEARCH_EFFORT=standard          # Research搜索深度（lite/standard/deep/exhaustive）
 
 # ===== 通知配置（可选）=====
 SMTP_SERVER=smtp.qq.com
@@ -72,19 +70,6 @@ MINIQMT_ENABLED=false
 MINIQMT_ACCOUNT_ID=
 MINIQMT_HOST=127.0.0.1
 MINIQMT_PORT=58080
-```
-
-### 测试
-
-You.com Research 模块的测试位于 `utils/test_youchannels_research.py`。
-
-```bash
-# 单元测试（无需 API key）
-python3 -m pytest utils/test_youchannels_research.py -v
-
-# 集成测试（需要 YDC_API_KEY 环境变量）
-export YDC_API_KEY=your_key_here
-python3 -m pytest utils/test_youchannels_research.py::TestGetYoudotcomResearchIntegration -v
 ```
 
 ### 当前完整数据链路
