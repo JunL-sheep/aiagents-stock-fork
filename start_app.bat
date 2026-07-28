@@ -26,7 +26,7 @@ echo ⏹️  按 Ctrl+C 停止服务
 echo ==================================================
 
 REM 启动Streamlit应用
-streamlit run app.py --server.port 8503 --server.address 127.0.0.1
+streamlit run app.py --server.port 8503 --server.address 0.0.0.0
 
 REM 如果出错，暂停以便查看错误信息
 if errorlevel 1 (
