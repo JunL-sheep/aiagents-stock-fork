@@ -5,8 +5,19 @@
 /test_pe_pb.py
 /venv
 /__pycache__
+/logs
 # 环境变量文件
 .env
 /.cursor
 /openspec
 TradEnv/
+
+# Python 字节码缓存（所有子目录）
+__pycache__/
+*.pyc
+*.pyo
+
+# 数据库文件（运行期数据，不入仓）
+*.db
+*.sqlite
+*.sqlite3

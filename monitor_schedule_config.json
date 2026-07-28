@@ -37,6 +37,6 @@
     5
   ],
   "auto_stop": true,
-  "pre_market_minutes": 5,
-  "post_market_minutes": 5
+  "pre_market_minutes": 30,
+  "post_market_minutes": 10
 }
