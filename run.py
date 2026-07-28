@@ -7,6 +7,13 @@ AI股票分析系统启动脚本
 import subprocess
 import sys
 import os
+import logging
+
+# 在拉起 Streamlit 子进程前先初始化日志系统，让子进程能继承到 root logger 的 handler
+from utils.logging_setup import setup_logging
+setup_logging()
+logger = logging.getLogger(__name__)
+logger.info("run.py 启动，准备拉起 Streamlit")
 
 def check_requirements():
     """检查必要的依赖是否安装"""
@@ -60,7 +67,7 @@ def main():
         subprocess.run([
             sys.executable, "-m", "streamlit", "run", "app.py",
             "--server.port", "8503",
-            "--server.address", "127.0.0.1"
+            "--server.address", "0.0.0.0"
         ])
     except KeyboardInterrupt:
         print("\n👋 感谢使用AI股票分析系统！")

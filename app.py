@@ -7,7 +7,15 @@ from datetime import datetime
 import time
 import base64
 import os
+import logging
 import config
+
+# 初始化日志落盘（幂等，不影响 Streamlit 与既有 print()/st.*() 行为）
+from utils.logging_setup import setup_logging
+setup_logging()
+
+logger = logging.getLogger(__name__)
+logger.info("app.py 已加载，开始执行 Streamlit 脚本")
 
 from stock_data import StockDataFetcher
 from ai_agents import StockAnalysisAgents
