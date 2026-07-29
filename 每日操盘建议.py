@@ -471,6 +471,25 @@ def main():
 
     print(f'✅ {msg}')
 
+    # 5b) 额外推送新闻流量相关段 → 新闻流量专用机器人（如已配置）
+    try:
+        from notification_service import notification_service
+        nf_lines = []
+        nf_lines.append(f"## 📊 新闻流量早报")
+        nf_lines.append(f"**{datetime.now().strftime('%Y-%m-%d %H:%M')}**")
+        nf_lines.append("")
+        if news_flow_md:
+            nf_lines.append(news_flow_md)
+            nf_lines.append("")
+        if overseas_md:
+            nf_lines.append(overseas_md)
+        nf_content = '\n'.join(nf_lines)
+        if nf_content.strip():
+            nf_ok = notification_service.send_news_flow_message('📊 新闻流量早报', nf_content)
+            print(f'📰 新闻流量机器人推送: {"✅" if nf_ok else "❌（未配置 NEWS_FLOW_WEBHOOK_URL）"}')
+    except Exception as e:
+        print(f'📰 新闻流量机器人推送失败: {e}')
+
     # 6) 推送成功后 → 注入监测池（覆盖式 + 7 天 TTL + 50 只上限）
     if args.skip_monitor:
         print('⏭️ --skip-monitor，跳过监测池注入')

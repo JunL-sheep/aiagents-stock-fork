@@ -100,17 +100,11 @@ def main():
         print(content)
         return 0
 
-    cfg = load_config()
-    if not cfg['webhook_enabled'] or not cfg['webhook_url']:
-        print("❌ 钉钉 Webhook 未配置或未启用")
-        return 1
+    # 推送到主 Webhook（通过 send_analysis_result 模拟盘中预警的双推送）
+    from notification_service import notification_service
+    ok1 = notification_service.send_analysis_result('🌍 隔夜外盘速览', content)
+    print(f"主Webhook+新闻流量Webhook: {'✅' if ok1 else '❌'}")
 
-    ok, msg = send_dingtalk(cfg['webhook_url'], cfg['webhook_keyword'], content)
-    if not ok:
-        print(f"❌ {msg}")
-        return 1
-
-    print(f"✅ {msg}")
     return 0
 
 
