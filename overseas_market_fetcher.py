@@ -37,17 +37,25 @@ INDICES = [
     {'symbol': '^IXIC',    'name': '纳斯达克', 'alias': 'NASDAQ'},
 ]
 
-# 美股 AI 头部公司（从今天的表现看，直接影响 A 股对应板块情绪）
-AI_STOCKS = [
-    {'symbol': 'NVDA',  'name': '英伟达',   'alias': 'NVIDIA'},
-    {'symbol': 'AMD',   'name': '超威',      'alias': 'AMD'},
-    {'symbol': 'MSFT',  'name': '微软',      'alias': 'Microsoft'},
-    {'symbol': 'GOOGL', 'name': '谷歌',      'alias': 'Alphabet'},
-    {'symbol': 'META',  'name': 'Meta',      'alias': 'Meta'},
-    {'symbol': 'AVGO',  'name': '博通',      'alias': 'Broadcom'},
-    {'symbol': 'MU',    'name': '美光',      'alias': 'Micron'},
-    {'symbol': 'TSM',   'name': '台积电',    'alias': 'TSMC ADR'},
-]
+# 美股 AI 头部公司（按业务板块分组，直接影响 A 股对应板块情绪）
+AI_STOCKS = {
+    'AI芯片': [
+        {'symbol': 'NVDA',  'name': '英伟达',   'alias': 'NVIDIA'},
+        {'symbol': 'AMD',   'name': '超威',      'alias': 'AMD'},
+    ],
+    '存储芯片': [
+        {'symbol': 'MU',    'name': '美光',      'alias': 'Micron'},
+    ],
+    'AI云平台': [
+        {'symbol': 'MSFT',  'name': '微软',      'alias': 'Microsoft'},
+        {'symbol': 'GOOGL', 'name': '谷歌',      'alias': 'Alphabet'},
+        {'symbol': 'META',  'name': 'Meta',      'alias': 'Meta'},
+    ],
+    '半导体代工/设备': [
+        {'symbol': 'AVGO',  'name': '博通',      'alias': 'Broadcom'},
+        {'symbol': 'TSM',   'name': '台积电',    'alias': 'TSMC ADR'},
+    ],
+}
 
 # 韩股半导体（影响 A 股半导体/存储芯片板块情绪）
 KR_SEMICON = [
@@ -132,7 +140,7 @@ def fetch_overseas_snapshot(
     """
     results = {
         'indices': [],
-        'ai_stocks': [],
+        'ai_stocks': [],        # 拉取统一存这里
         'kr_semicon': [],
         'currency': [],
         'fetch_time': datetime.now().strftime('%Y-%m-%d %H:%M'),
@@ -152,7 +160,12 @@ def fetch_overseas_snapshot(
     if include_indices:
         _batch(INDICES, 'indices')
     if include_ai_stocks:
-        _batch(AI_STOCKS, 'ai_stocks')
+        # 展平分组字典为列表进行拉取
+        flat_ai = []
+        for group_name, group_stocks in AI_STOCKS.items():
+            for s in group_stocks:
+                flat_ai.append(s)
+        _batch(flat_ai, 'ai_stocks')
     if include_kr_semicon:
         _batch(KR_SEMICON, 'kr_semicon')
     _batch(CURRENCY, 'currency')
@@ -160,14 +173,15 @@ def fetch_overseas_snapshot(
     return results
 
 
-def format_overseas_snapshot_md(data: Dict, max_stocks: int = 8) -> str:
+def format_overseas_snapshot_md(data: Dict) -> str:
     """
     把 fetch_overseas_snapshot 的结果格式化为 markdown 段，
     嵌入每日操盘简报。
 
+    颜色约定（A 股惯例）：🔴 涨 🟢 跌
+
     Args:
         data: fetch_overseas_snapshot 的返回值
-        max_stocks: 最多展示多少只 AI 个股
 
     Returns:
         markdown 字符串（无内容时返回空字符串）
@@ -180,6 +194,20 @@ def format_overseas_snapshot_md(data: Dict, max_stocks: int = 8) -> str:
 
     if not any([indices, ai_stocks, kr_semicon]):
         return ''
+
+    # 把 ai_stocks 展平列表按 AI_STOCKS 分组还原
+    def _group_ai():
+        """将 ai_stocks 按 AI_STOCKS 的分组归类"""
+        by_sym = {s['symbol']: s for s in ai_stocks}
+        groups = {}
+        for group_name, group_stocks in AI_STOCKS.items():
+            items = []
+            for gs in group_stocks:
+                if gs['symbol'] in by_sym:
+                    items.append(by_sym[gs['symbol']])
+            if items:
+                groups[group_name] = items
+        return groups
 
     lines = []
     lines.append("---")
@@ -194,7 +222,7 @@ def format_overseas_snapshot_md(data: Dict, max_stocks: int = 8) -> str:
         lines.append("### 🇺🇸 美股指数")
         for idx in indices:
             chg = idx.get('change_pct', 0)
-            emoji = '🟢' if chg >= 0 else '🔴'
+            emoji = '🔴' if chg >= 0 else '🟢'  # A 股红涨绿跌
             arrow = '↑' if chg >= 0 else '↓'
             lines.append(
                 f"  {emoji} **{idx['name']}**  {idx['close']:,}  "
@@ -202,17 +230,20 @@ def format_overseas_snapshot_md(data: Dict, max_stocks: int = 8) -> str:
             )
         lines.append("")
 
-    # ── 美股 AI 头部公司 ──
+    # ── 美股 AI 头部公司（按业务板块分组）──
     if ai_stocks:
         lines.append("### 🤖 美股 AI 板块")
-        for s in ai_stocks[:max_stocks]:
-            chg = s.get('change_pct', 0)
-            emoji = '🟢' if chg >= 0 else '🔴'
-            arrow = '↑' if chg >= 0 else '↓'
-            lines.append(
-                f"  {emoji} **{s['name']}** {s['close']:,.2f}  "
-                f"{arrow} {abs(chg):.2f}%"
-            )
+        groups = _group_ai()
+        for group_name, group_items in groups.items():
+            lines.append(f"  **{group_name}**")
+            for s in group_items:
+                chg = s.get('change_pct', 0)
+                emoji = '🔴' if chg >= 0 else '🟢'
+                arrow = '↑' if chg >= 0 else '↓'
+                lines.append(
+                    f"    {emoji} {s['name']}  {s['close']:,.2f}  "
+                    f"{arrow} {abs(chg):.2f}%"
+                )
         lines.append("")
 
     # ── 韩股半导体 ──
@@ -220,9 +251,8 @@ def format_overseas_snapshot_md(data: Dict, max_stocks: int = 8) -> str:
         lines.append("### 🇰🇷 韩股半导体")
         for s in kr_semicon:
             chg = s.get('change_pct', 0)
-            emoji = '🟢' if chg >= 0 else '🔴'
+            emoji = '🔴' if chg >= 0 else '🟢'
             arrow = '↑' if chg >= 0 else '↓'
-            # 韩元金额大，不加逗号
             lines.append(
                 f"  {emoji} **{s['name']}** {s['close']:,.0f}  "
                 f"{arrow} {abs(chg):.2f}%"
@@ -235,11 +265,10 @@ def format_overseas_snapshot_md(data: Dict, max_stocks: int = 8) -> str:
     down = sum(1 for x in all_items if x.get('change_pct', 0) < 0)
     total = up + down
     if total > 0:
-        # 用可视进度条表示涨跌比
         bar_len = 10
         up_len = round(up / total * bar_len)
         down_len = bar_len - up_len
-        bar = '🟢' * up_len + '🔴' * down_len
+        bar = '🔴' * up_len + '🟢' * down_len  # 红涨绿跌
         lines.append(f"> **市场情绪**: {bar}  (涨 {up}/{total}  跌 {down}/{total})")
         lines.append("")
 
