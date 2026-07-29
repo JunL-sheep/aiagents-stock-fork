@@ -29,9 +29,10 @@ class NotificationService:
             'webhook_enabled': False,
             'webhook_url': '',
             'webhook_type': 'dingtalk',  # dingtalk 或 feishu
-            'webhook_keyword': 'aiagents通知'  # 钉钉自定义关键词
+            'webhook_keyword': 'aiagents通知',  # 钉钉自定义关键词
+            'news_flow_webhook_url': '',  # 新闻流量专用机器人
         }
-        
+
         # 从环境变量加载配置
         if os.getenv('EMAIL_ENABLED'):
             config['email_enabled'] = os.getenv('EMAIL_ENABLED').lower() == 'true'
@@ -53,7 +54,9 @@ class NotificationService:
             config['webhook_type'] = os.getenv('WEBHOOK_TYPE').lower()
         if os.getenv('WEBHOOK_KEYWORD'):
             config['webhook_keyword'] = os.getenv('WEBHOOK_KEYWORD')
-        
+        if os.getenv('NEWS_FLOW_WEBHOOK_URL'):
+            config['news_flow_webhook_url'] = os.getenv('NEWS_FLOW_WEBHOOK_URL')
+
         return config
     
     def send_notifications(self):
@@ -106,10 +109,34 @@ class NotificationService:
 
         return success
 
+    def _send_dingtalk_markdown(self, webhook_url: str, keyword: str, title: str, text: str) -> bool:
+        """向指定的钉钉 Webhook 发送 markdown 消息"""
+        try:
+            import requests
+            data = {
+                'msgtype': 'markdown',
+                'markdown': {
+                    'title': f"{keyword} - {title}",
+                    'text': f"### {keyword} - {title}\n\n{text}",
+                }
+            }
+            r = requests.post(webhook_url, json=data, headers={'Content-Type': 'application/json'}, timeout=10)
+            if r.status_code == 200:
+                result = r.json()
+                if result.get('errcode') == 0:
+                    return True
+                else:
+                    print(f"[Webhook] 发送失败: {result.get('errmsg')}")
+            else:
+                print(f"[Webhook] HTTP {r.status_code}")
+        except Exception as e:
+            print(f"[Webhook] 异常: {e}")
+        return False
+
     def send_analysis_result(self, subject: str, content: str) -> bool:
         """
-        发送分析结果（带 subject 主题）
-        供 news_flow_alert 模块调用（板块级预警用）
+        发送新闻流量分析结果。
+        同时推送到主 Webhook 和新闻流量专用 Webhook（如已配置）。
 
         Args:
             subject: 消息主题（如"⚠️ 新闻流量危险预警"）
@@ -121,34 +148,18 @@ class NotificationService:
         success = False
         keyword = self.config.get('webhook_keyword', '股票')
 
+        # 推送到主 Webhook
         if self.config['webhook_enabled']:
-            try:
-                import requests
-                # 钉钉 markdown 格式
-                data = {
-                    'msgtype': 'markdown',
-                    'markdown': {
-                        'title': f"{keyword} - {subject}",
-                        'text': f"### {keyword} - {subject}\n\n{content}",
-                    }
-                }
-                r = requests.post(
-                    self.config['webhook_url'],
-                    json=data,
-                    headers={'Content-Type': 'application/json'},
-                    timeout=10
-                )
-                if r.status_code == 200:
-                    result = r.json()
-                    if result.get('errcode') == 0:
-                        success = True
-                    else:
-                        print(f"[Webhook] 发送失败: {result.get('errmsg')}")
-                else:
-                    print(f"[Webhook] HTTP {r.status_code}")
-            except Exception as e:
-                print(f"[Webhook] 异常: {e}")
+            if self._send_dingtalk_markdown(self.config['webhook_url'], keyword, subject, content):
+                success = True
 
+        # 额外推送到新闻流量专用 Webhook（如配置了）
+        news_flow_url = self.config.get('news_flow_webhook_url', '')
+        if news_flow_url:
+            if self._send_dingtalk_markdown(news_flow_url, '新闻流量分析', subject, content):
+                success = True
+
+        # 邮件（备用）
         if self.config['email_enabled']:
             try:
                 import smtplib
@@ -172,7 +183,25 @@ class NotificationService:
                 print(f"[Email] 异常: {e}")
 
         return success
-    
+
+    def send_news_flow_message(self, subject: str, content: str) -> bool:
+        """
+        向新闻流量专用 Webhook 推送消息（不推送主 Webhook）。
+        供隔夜外盘速览等纯新闻流量内容使用。
+
+        Args:
+            subject: 消息主题
+            content: 消息正文（已格式化的 markdown）
+
+        Returns:
+            bool: 是否推送成功
+        """
+        news_flow_url = self.config.get('news_flow_webhook_url', '')
+        if not news_flow_url:
+            print("[新闻流量] 未配置 NEWS_FLOW_WEBHOOK_URL，跳过推送")
+            return False
+        return self._send_dingtalk_markdown(news_flow_url, '新闻流量分析', subject, content)
+
     def _send_email_notification(self, notification: Dict) -> bool:
         """发送邮件通知"""
         try:
@@ -364,7 +393,7 @@ class NotificationService:
             webhook_type = self.config['webhook_type']
             
             if webhook_type == 'dingtalk':
-                return self._send_dingtalk_webhook(notification)
+                return self._send_webhook_notification_inner(notification)
             elif webhook_type == 'feishu':
                 return self._send_feishu_webhook(notification)
             else:
@@ -375,7 +404,7 @@ class NotificationService:
             print(f"Webhook发送失败: {e}")
             return False
     
-    def _send_dingtalk_webhook(self, notification: Dict) -> bool:
+    def _send_webhook_notification_inner(self, notification: Dict) -> bool:
         """发送钉钉Webhook通知"""
         try:
             import requests
@@ -573,7 +602,7 @@ _此消息由AI股票分析系统自动发送_"""
             webhook_type = self.config['webhook_type']
             
             if webhook_type == 'dingtalk':
-                success = self._send_dingtalk_webhook(test_notification)
+                success = self._send_webhook_notification_inner(test_notification)
                 if success:
                     return True, "钉钉Webhook测试成功！请检查钉钉群消息。"
                 else:
