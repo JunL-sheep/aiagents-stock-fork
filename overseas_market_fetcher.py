@@ -217,12 +217,12 @@ def format_overseas_snapshot_md(data: Dict) -> str:
         lines.append(f"*数据时间: {fetch_time}（北京时间）*")
     lines.append("")
 
-    # ── 美股三大指数 ──
+    # ── 美股指数 ──
     if indices:
         lines.append("### 🇺🇸 美股指数")
         for idx in indices:
             chg = idx.get('change_pct', 0)
-            emoji = '🔴' if chg >= 0 else '🟢'  # A 股红涨绿跌
+            emoji = '🔴' if chg >= 0 else '🟢'
             arrow = '↑' if chg >= 0 else '↓'
             lines.append(
                 f"  {emoji} **{idx['name']}**  {idx['close']:,}  "
@@ -234,7 +234,11 @@ def format_overseas_snapshot_md(data: Dict) -> str:
     if ai_stocks:
         lines.append("### 🤖 美股 AI 板块")
         groups = _group_ai()
+        first = True
         for group_name, group_items in groups.items():
+            if not first:
+                lines.append("")  # 分组之间空行
+            first = False
             lines.append(f"  **{group_name}**")
             for s in group_items:
                 chg = s.get('change_pct', 0)
