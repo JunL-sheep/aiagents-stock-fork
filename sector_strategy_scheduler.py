@@ -3,6 +3,7 @@
 支持定时运行板块策略分析并发送邮件通知
 """
 
+import os
 import schedule
 import threading
 import time
@@ -172,16 +173,25 @@ class SectorStrategyScheduler:
             timestamp = result.get("timestamp", datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
             
             sent_count = 0
-            
-            # 尝试发送Webhook
-            if config.get('webhook_enabled') and config.get('webhook_url'):
-                print("[智策定时] [Webhook] 准备发送...")
-                webhook_success = self._send_webhook_direct(predictions, timestamp)
+
+            # 尝试发送Webhook - 优先使用智策板块专属Webhook
+            sector_webhook = self._get_sector_webhook_config()
+            if sector_webhook['enabled'] and sector_webhook['webhook_url']:
+                print("[智策定时] [智策专属Webhook] 准备发送...")
+                webhook_success = self._send_sector_webhook(predictions, timestamp)
                 if webhook_success:
-                    print("[智策定时] ✓ Webhook发送成功")
+                    print("[智策定时] ✓ 智策专属Webhook发送成功")
                     sent_count += 1
                 else:
-                    print("[智策定时] ✗ Webhook发送失败")
+                    print("[智策定时] ✗ 智策专属Webhook发送失败")
+            elif config.get('webhook_enabled') and config.get('webhook_url'):
+                print("[智策定时] [共享Webhook] 准备发送...")
+                webhook_success = self._send_webhook_direct(predictions, timestamp)
+                if webhook_success:
+                    print("[智策定时] ✓ 共享Webhook发送成功")
+                    sent_count += 1
+                else:
+                    print("[智策定时] ✗ 共享Webhook发送失败")
             
             # 尝试发送邮件
             if config.get('email_enabled') and all([
@@ -254,7 +264,209 @@ class SectorStrategyScheduler:
             import traceback
             traceback.print_exc()
             return False
-    
+
+    def _get_sector_webhook_config(self):
+        """加载智策板块专属Webhook配置"""
+        from dotenv import load_dotenv
+        load_dotenv()
+        return {
+            'enabled': os.getenv('SECTOR_WEBHOOK_ENABLED', 'false').lower() == 'true',
+            'webhook_type': os.getenv('SECTOR_WEBHOOK_TYPE', 'dingtalk'),
+            'webhook_url': os.getenv('SECTOR_WEBHOOK_URL', ''),
+            'webhook_keyword': os.getenv('SECTOR_WEBHOOK_KEYWORD', '智策板块'),
+        }
+
+    def _send_sector_webhook(self, predictions, timestamp):
+        """使用智策专属Webhook发送通知"""
+        config = self._get_sector_webhook_config()
+        url = config['webhook_url']
+        webhook_type = config['webhook_type']
+        keyword = config['webhook_keyword']
+
+        # 格式化摘要
+        summary = self._format_sector_webhook_summary(predictions, timestamp, keyword)
+
+        if webhook_type == 'dingtalk':
+            return self._send_dingtalk_sector(url, summary, timestamp, keyword)
+        elif webhook_type == 'feishu':
+            return self._send_feishu_sector(url, summary, timestamp, keyword)
+        else:
+            print(f"[智策定时] ✗ 不支持的webhook类型: {webhook_type}")
+            return False
+
+    def _send_dingtalk_sector(self, url, summary, timestamp, keyword):
+        """通过智策专属钉钉Webhook发送消息"""
+        try:
+            import requests
+
+            title_prefix = f"{keyword} - " if keyword else ""
+
+            data = {
+                "msgtype": "markdown",
+                "markdown": {
+                    "title": f"{title_prefix}智策板块分析报告",
+                    "text": summary
+                }
+            }
+
+            response = requests.post(url, json=data, headers={'Content-Type': 'application/json'}, timeout=10)
+
+            if response.status_code == 200:
+                result = response.json()
+                return result.get('errcode') == 0
+            return False
+
+        except Exception as e:
+            print(f"[智策定时] 智策专属钉钉发送异常: {e}")
+            return False
+
+    def _send_feishu_sector(self, url, summary, timestamp, keyword):
+        """通过智策专属飞书Webhook发送消息"""
+        try:
+            import requests
+
+            title_prefix = f"【{keyword} - " if keyword else "【"
+
+            data = {
+                "msg_type": "text",
+                "content": {
+                    "text": f"{title_prefix}智策板块分析报告】\n分析时间: {timestamp}\n\n{summary}"
+                }
+            }
+
+            response = requests.post(url, json=data, headers={'Content-Type': 'application/json'}, timeout=10)
+
+            if response.status_code == 200:
+                result = response.json()
+                return result.get('code') == 0
+            return False
+
+        except Exception as e:
+            print(f"[智策定时] 智策专属飞书发送异常: {e}")
+            return False
+
+    def _format_sector_webhook_summary(self, predictions, timestamp, keyword):
+        """格式化智策板块Webhook推送摘要"""
+        title_prefix = f"{keyword} - " if keyword else ""
+
+        lines = []
+        lines.append(f"### {title_prefix}智策板块分析报告")
+        lines.append(f"**分析时间**: {timestamp}")
+        lines.append("")
+
+        # 板块多空（只显示高信心度的）
+        long_short = predictions.get("long_short", {})
+        if long_short:
+            bullish = [item for item in long_short.get("bullish", []) if item.get('confidence', 0) >= 7]
+            bearish = [item for item in long_short.get("bearish", []) if item.get('confidence', 0) >= 7]
+
+            if bullish or bearish:
+                lines.append("#### 📊 板块多空")
+                if bullish:
+                    lines.append("**看多**: " + "、".join([f"{item.get('sector')}({item.get('confidence')}分)" for item in bullish[:3]]))
+                if bearish:
+                    lines.append("**看空**: " + "、".join([f"{item.get('sector')}({item.get('confidence')}分)" for item in bearish[:3]]))
+                lines.append("")
+
+        # 板块轮动（潜力板块）
+        rotation = predictions.get("rotation", {})
+        if rotation:
+            potential = rotation.get("potential", [])[:3]
+            if potential:
+                lines.append("#### 🔄 潜力接力板块")
+                for item in potential:
+                    lines.append(f"- {item.get('sector')}: {item.get('advice', 'N/A')}")
+                lines.append("")
+
+        # 板块热度TOP3
+        heat = predictions.get("heat", {})
+        if heat:
+            hottest = heat.get("hottest", [])[:3]
+            if hottest:
+                lines.append("#### 🌡️ 热度TOP3")
+                for idx, item in enumerate(hottest, 1):
+                    lines.append(f"{idx}. {item.get('sector')} - {item.get('score', 0)}分")
+                lines.append("")
+
+        # 核心机会
+        summary = predictions.get("summary", {})
+        if summary and summary.get('key_opportunity'):
+            lines.append("#### 💡 核心机会")
+            lines.append(summary['key_opportunity'][:150] + "..." if len(summary.get('key_opportunity', '')) > 150 else summary.get('key_opportunity', ''))
+            lines.append("")
+
+        lines.append("---")
+        lines.append("*由智策AI系统自动生成*")
+
+        return "\n".join(lines)
+
+    def test_sector_webhook(self) -> tuple[bool, str]:
+        """测试智策专属Webhook配置"""
+        config = self._get_sector_webhook_config()
+
+        if not config['enabled']:
+            return False, "智策Webhook未启用（SECTOR_WEBHOOK_ENABLED=false）"
+
+        if not config['webhook_url']:
+            return False, "智策Webhook URL未配置（SECTOR_WEBHOOK_URL为空）"
+
+        try:
+            import requests
+            keyword = config['webhook_keyword']
+            title_prefix = f"{keyword} - " if keyword else ""
+
+            test_text = f"""### {title_prefix}智策板块测试消息
+
+**这是一条测试消息**
+如果您收到此消息，说明智策板块Webhook配置正确！
+
+**配置信息**:
+- Webhook类型: {config['webhook_type']}
+- 自定义关键词: {keyword or '未设置'}
+- 测试时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+
+---
+*由智策AI系统自动发送*
+"""
+
+            data = {
+                "msgtype": "markdown",
+                "markdown": {
+                    "title": f"{title_prefix}智策板块测试",
+                    "text": test_text
+                }
+            }
+
+            response = requests.post(
+                config['webhook_url'],
+                json=data,
+                headers={'Content-Type': 'application/json'},
+                timeout=10
+            )
+
+            if response.status_code == 200:
+                result = response.json()
+                if result.get('errcode') == 0:
+                    return True, "✅ 测试消息发送成功！请检查钉钉群消息。"
+                else:
+                    return False, f"❌ 钉钉返回错误: {result.get('errmsg')}"
+            else:
+                return False, f"❌ HTTP请求失败: {response.status_code}"
+
+        except Exception as e:
+            return False, f"❌ 发送异常: {str(e)}"
+
+    def get_sector_webhook_status(self) -> dict:
+        """获取智策专属Webhook配置状态"""
+        config = self._get_sector_webhook_config()
+        return {
+            'enabled': config['enabled'],
+            'webhook_type': config['webhook_type'],
+            'webhook_url': config['webhook_url'][:50] + '...' if config['webhook_url'] else '未配置',
+            'webhook_keyword': config['webhook_keyword'],
+            'configured': bool(config['webhook_url'])
+        }
+
     def _send_dingtalk(self, url, summary, timestamp):
         """发送钉钉消息"""
         try:

@@ -1087,6 +1087,53 @@ def display_scheduler_settings():
         st.markdown("---")
         check_email_config()
 
+        # 智策专属Webhook配置
+        st.markdown("---")
+        display_sector_webhook_config()
+
+
+def display_sector_webhook_config():
+    """显示智策板块专属Webhook配置"""
+    st.markdown("**🤖 智策板块专属钉钉推送**")
+    st.caption("配置独立的钉钉机器人专门接收智策板块分析结果，与监测系统推送分开")
+
+    status = sector_strategy_scheduler.get_sector_webhook_status()
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.markdown("**当前配置**")
+        st.write(f"{'✅' if status['enabled'] else '❌'} 启用状态: {'已启用' if status['enabled'] else '未启用'}")
+        st.write(f"{'✅' if status['configured'] else '❌'} Webhook地址: {status['webhook_url']}")
+        st.write(f"关键词: {status['webhook_keyword']}")
+
+        if status['enabled'] and status['configured']:
+            st.success("✅ 智策Webhook配置完整")
+        else:
+            st.warning("⚠️ 请在 .env 文件中配置 SECTOR_WEBHOOK 相关项")
+
+    with col2:
+        st.markdown("**操作**")
+        col_a, col_b = st.columns(2)
+        with col_a:
+            if st.button("📤 测试推送", key="test_sector_webhook", width='content'):
+                success, message = sector_strategy_scheduler.test_sector_webhook()
+                if success:
+                    st.success(message)
+                else:
+                    st.error(message)
+        with col_b:
+            st.markdown("")
+            st.caption("测试前请先在.env中配置")
+
+        st.markdown("")
+        st.info("📌 **配置方法**: 编辑项目根目录的 `.env` 文件，设置以下变量：\n\n"
+                "```\n"
+                "SECTOR_WEBHOOK_ENABLED=true\n"
+                "SECTOR_WEBHOOK_URL=你的钉钉机器人Webhook地址\n"
+                "SECTOR_WEBHOOK_KEYWORD=智策板块\n"
+                "```")
+
 
 def check_email_config():
     """检查邮件配置"""
