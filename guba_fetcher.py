@@ -61,6 +61,30 @@ def _init_db():
             PRIMARY KEY (update_time, code, concept)
         )
     ''')
+    # T1 主流媒体数据: 百度热搜 A 股 (每日)
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS baidu_hot (
+            trade_date TEXT,
+            name_code TEXT,
+            change_pct REAL,
+            hot_score REAL,
+            hot_rank INTEGER,
+            updated_at TEXT,
+            PRIMARY KEY (trade_date, name_code)
+        )
+    ''')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_baidu_rank ON baidu_hot(hot_rank)')
+    # T2 时序数据: 单股 30 日关注指数趋势
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS focus_trend (
+            trade_date TEXT,
+            code TEXT,
+            name TEXT,
+            focus_index REAL,
+            PRIMARY KEY (trade_date, code)
+        )
+    ''')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_focus_code_date ON focus_trend(code, trade_date DESC)')
     conn.commit()
     conn.close()
 
@@ -116,6 +140,167 @@ def _save_concept_hot(df):
     logger.info(f'已保存 {len(rows)} 条 concept_hot')
 
 
+def _save_baidu_hot():
+    """
+    拉取并保存 百度热搜 A 股 top 12
+    T1 数据源: 主流媒体/搜索引擎关注度
+    """
+    import akshare as ak
+    import pandas as pd
+    today = datetime.now().strftime('%Y-%m-%d')
+    now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    # 避免重复拉取 (一天一次)
+    cnt = c.execute('SELECT COUNT(*) FROM baidu_hot WHERE trade_date=?', (today,)).fetchone()[0]
+    if cnt > 0:
+        conn.close()
+        logger.info(f'今天 ({today}) 已有 {cnt} 条百度热搜, 跳过')
+        return
+    try:
+        df = ak.stock_hot_search_baidu(symbol='A股')
+        rows = []
+        for rank, (_, r) in enumerate(df.iterrows(), 1):
+            name_code = str(r['名称/代码']) if pd.notna(r['名称/代码']) else ''
+            chg = 0
+            try:
+                chg_str = str(r['涨跌幅']).replace('%', '').strip()
+                chg = float(chg_str) if chg_str and chg_str != 'nan' else 0
+            except (ValueError, TypeError):
+                pass
+            hot = 0
+            try:
+                hot = float(r['综合热度']) if pd.notna(r['综合热度']) else 0
+            except (ValueError, TypeError):
+                pass
+            rows.append((today, name_code, chg, hot, rank, now))
+        c.executemany('''INSERT OR REPLACE INTO baidu_hot
+            (trade_date, name_code, change_pct, hot_score, hot_rank, updated_at) VALUES (?, ?, ?, ?, ?, ?)''',
+            rows)
+        conn.commit()
+        conn.close()
+        logger.info(f'已保存 {len(rows)} 条 baidu_hot (百度热搜 A 股 top 12)')
+    except Exception as e:
+        conn.close()
+        logger.warning(f'百度热搜拉取失败: {e}')
+
+
+def query_baidu_hot(top_n: int = 12) -> list:
+    """取今天的百度热搜 A 股 top N"""
+    _init_db()
+    today = datetime.now().strftime('%Y-%m-%d')
+    conn = sqlite3.connect(DB_PATH)
+    rows = conn.execute('''SELECT name_code, change_pct, hot_score, hot_rank
+        FROM baidu_hot WHERE trade_date=? ORDER BY hot_rank LIMIT ?''', (today, top_n)).fetchall()
+    conn.close()
+    return [
+        {'name_code': r[0], 'change_pct': r[1], 'hot_score': r[2], 'hot_rank': r[3]}
+        for r in rows
+    ]
+
+
+def _save_focus_trend(code: str, df):
+    """保存单股 30 日关注指数趋势"""
+    import pandas as pd
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    # 先删该股旧数据 (覆盖式)
+    c.execute('DELETE FROM focus_trend WHERE code=?', (code,))
+    rows = []
+    for _, r in df.iterrows():
+        d = str(r['交易日'])[:10]
+        idx = float(r['用户关注指数']) if pd.notna(r['用户关注指数']) else 0
+        rows.append((d, code, '', idx))
+    c.executemany('''INSERT INTO focus_trend (trade_date, code, name, focus_index)
+        VALUES (?, ?, ?, ?)''', rows)
+    conn.commit()
+    conn.close()
+
+
+def fetch_focus_trend(codes: list, force: bool = False) -> int:
+    """
+    批量拉取多只股的 30 日关注指数趋势
+    - 单只约 1 秒 (AKShare)
+    - 10 只约 10 秒
+    - 默认只对 top 10 关注股 + 智瞰龙虎推荐股 (约 20 只) 拉
+    - 如果已经拉过今天的数据, 跳过 (force=True 强制重拉)
+    """
+    import akshare as ak
+    import pandas as pd
+    today = datetime.now().strftime('%Y-%m-%d')
+    if not codes:
+        return 0
+    n_saved = 0
+    for code in codes:
+        if not force:
+            conn = sqlite3.connect(DB_PATH)
+            cnt = conn.execute('SELECT COUNT(*) FROM focus_trend WHERE code=? AND trade_date=?',
+                               (code, today)).fetchone()[0]
+            conn.close()
+            if cnt > 0:
+                continue
+        try:
+            df = ak.stock_comment_detail_scrd_focus_em(symbol=code)
+            if df is not None and not df.empty:
+                _save_focus_trend(code, df)
+                n_saved += 1
+        except Exception as e:
+            logger.warning(f'  {code} 30日关注拉取失败: {e}')
+    logger.info(f'已拉取 {n_saved}/{len(codes)} 只股的 30 日关注指数')
+    return n_saved
+
+
+def query_focus_trend(code: str, days: int = 30) -> list:
+    """取单股 N 日关注指数趋势"""
+    _init_db()
+    conn = sqlite3.connect(DB_PATH)
+    rows = conn.execute('''SELECT trade_date, focus_index FROM focus_trend
+        WHERE code=? ORDER BY trade_date DESC LIMIT ?''', (code, days)).fetchall()
+    conn.close()
+    return [{'date': r[0], 'focus_index': r[1]} for r in reversed(rows)]
+
+
+def focus_trend_summary(code: str) -> dict:
+    """
+    把 30 日关注指数趋势压缩成 AI 友好的信号
+    返回: {
+        'current': 95.2,
+        'avg_5d': 94.8,
+        'avg_30d': 92.5,
+        'trend_5d': '+0.4',  # 5 日变化
+        'trend_label': 'rising',  # rising/falling/stable
+        'peak_30d': 96.0,
+        'days_at_peak': 5,  # 高位停留天数
+    }
+    """
+    rows = query_focus_trend(code, 30)
+    if not rows:
+        return None
+    indices = [r['focus_index'] for r in rows]
+    current = indices[-1]
+    avg_5d = sum(indices[-5:]) / min(5, len(indices))
+    avg_30d = sum(indices) / len(indices)
+    peak = max(indices)
+    days_at_peak = sum(1 for i in indices if i >= peak - 0.5)
+    # 趋势判断: 5日均 vs 30日均
+    if avg_5d > avg_30d + 0.5:
+        trend_label = 'rising'
+    elif avg_5d < avg_30d - 0.5:
+        trend_label = 'falling'
+    else:
+        trend_label = 'stable'
+    trend_5d = indices[-1] - indices[-5] if len(indices) >= 5 else 0
+    return {
+        'current': current,
+        'avg_5d': round(avg_5d, 1),
+        'avg_30d': round(avg_30d, 1),
+        'trend_5d': round(trend_5d, 2),
+        'trend_label': trend_label,
+        'peak_30d': peak,
+        'days_at_peak': days_at_peak,
+    }
+
+
 def fetch_all(force_refresh: bool = False) -> Dict:
     """
     拉取所有股吧情绪数据 (主入口)
@@ -148,6 +333,13 @@ def fetch_all(force_refresh: bool = False) -> Dict:
         _save_concept_hot(df_kw)
     except Exception as e:
         logger.warning(f'概念热度拉取失败: {e}')
+
+    # 3. T1 主流媒体: 百度热搜 A 股
+    logger.info('拉取 stock_hot_search_baidu (百度热搜)...')
+    try:
+        _save_baidu_hot()
+    except Exception as e:
+        logger.warning(f'百度热搜拉取失败: {e}')
 
     return {'ok': True, 'date': today, 'count': cnt}
 
