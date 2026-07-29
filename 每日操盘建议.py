@@ -304,10 +304,10 @@ def _confidence_to_rating(conf: str) -> str:
     return {'高': '买入', '中': '持有', '低': '卖出'}.get(conf, '持有')
 
 
-def inject_to_monitor_pool(recs, quotes, ttl_days: int = 7, max_pool: int = 20):
+def inject_to_monitor_pool(recs, quotes, ttl_days: int = 7, max_pool: int = 50):
     """
     把报告里的推荐股灌进 monitor_db 监测池。
-    依赖 monitor_db.upsert_with_ttl：覆盖式 + 7 天 TTL + 20 只上限。
+    依赖 monitor_db.upsert_with_ttl：覆盖式 + 7 天 TTL + 50 只上限。
 
     返回 monitor_db.upsert_with_ttl 的结果 dict；模块加载失败时返回 None。
     """
@@ -418,7 +418,7 @@ def main():
 
     print(f'✅ {msg}')
 
-    # 6) 推送成功后 → 注入监测池（覆盖式 + 7 天 TTL + 20 只上限）
+    # 6) 推送成功后 → 注入监测池（覆盖式 + 7 天 TTL + 50 只上限）
     if args.skip_monitor:
         print('⏭️ --skip-monitor，跳过监测池注入')
         return 0
@@ -428,7 +428,7 @@ def main():
         report['recommended_stocks'],
         quotes,
         ttl_days=7,
-        max_pool=20,
+        max_pool=50,
     )
     return 0
 

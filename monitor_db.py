@@ -95,6 +95,34 @@ class StockMonitorDatabase:
             cursor.execute("ALTER TABLE notifications ADD COLUMN context TEXT")
             print("✅ 已添加notifications.context字段")
 
+        # 创建操盘策略日志表（推送记录归档，用于后续策略复盘）
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS recommendation_journal (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                stock_id INTEGER,
+                symbol TEXT NOT NULL,
+                name TEXT,
+                signal_type TEXT NOT NULL,        -- entry / take_profit / stop_loss
+                trigger_price REAL,               -- 触发时价格
+                entry_min REAL,                   -- 进场区间下限（entry 信号）
+                entry_max REAL,                   -- 进场区间上限（entry 信号）
+                take_profit REAL,                 -- 止盈价
+                stop_loss REAL,                   -- 止损价
+                advisor_verdicts TEXT,            -- JSON: 各 advisor 的 decision+reason
+                pushed INTEGER DEFAULT 0,         -- 是否实际推送
+                suppressed INTEGER DEFAULT 0,     -- 是否被抑制
+                suppress_reason TEXT,             -- 抑制原因汇总
+                context_snapshot TEXT,            -- JSON: 完整行情/持仓快照
+                triggered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (stock_id) REFERENCES monitored_stocks (id)
+            )
+        ''')
+        cursor.execute('''
+            CREATE INDEX IF NOT EXISTS idx_journal_symbol_time
+            ON recommendation_journal (symbol, triggered_at DESC)
+        ''')
+        print("✅ 已创建recommendation_journal表（操盘策略日志）")
+
         conn.commit()
         conn.close()
     
@@ -652,7 +680,7 @@ class StockMonitorDatabase:
 
     def upsert_with_ttl(self, monitors_data: List[Dict],
                          ttl_days: int = 7,
-                         max_pool: int = 20) -> Dict[str, int]:
+                         max_pool: int = 50) -> Dict[str, int]:
         """
         带 TTL 的批量 upsert（每日报告 → 监测池注入专用）。
 
@@ -668,7 +696,7 @@ class StockMonitorDatabase:
         参数：
             monitors_data: 列表，每项至少含 symbol/code + entry_min/max + TP/SL
             ttl_days: 观察天数，默认 7
-            max_pool: 监测池最大股票数，默认 20
+            max_pool: 监测池最大股票数，默认 50
 
         返回：
             {"added", "updated", "expired_purged", "evicted", "failed", "total"}
@@ -838,7 +866,7 @@ class StockMonitorDatabase:
         conn.commit()
         conn.close()
 
-    def get_a_share_stocks_for_fast_poll(self, cap: int = 20) -> List[Dict]:
+    def get_a_share_stocks_for_fast_poll(self, cap: int = 50) -> List[Dict]:
         """
         取所有未过期的 A 股监测股票（symbol 为 6 位数字），
         供 monitor_service 的 TDX 秒级快路径使用。
@@ -914,6 +942,75 @@ class StockMonitorDatabase:
             'active': active,
             'expiring_soon': expiring_soon,
         }
+
+    def record_recommendation(self, stock: Dict, signal_type: str,
+                              trigger_price: Optional[float],
+                              advisor_decision: Optional[Dict] = None,
+                              context: Optional[Dict] = None) -> int:
+        """
+        记录操盘策略日志（推送历史归档，用于后续策略复盘对比）。
+
+        每次 advisor 做出入场/止盈/止损决策后调用，记录决策时的完整快照。
+        与 notifications（推送队列）不同，此表**只增不删**，永久保留。
+
+        Args:
+            stock: 监测股票 dict（含 symbol, name, entry_range, take_profit, stop_loss）
+            signal_type: entry / take_profit / stop_loss
+            trigger_price: 触发时的价格
+            advisor_decision: _evaluate_entry_decision 返回的 dict（含 should_push/suppressed/reasons）
+            context: _build_notification_context 返回的行情/持仓快照
+
+        Returns:
+            int: 新记录的 id
+        """
+        symbol = stock.get('symbol', '')
+        name = stock.get('name', '')
+        entry_range = stock.get('entry_range') or {}
+        entry_min = entry_range.get('min')
+        entry_max = entry_range.get('max')
+        tp = stock.get('take_profit')
+        sl = stock.get('stop_loss')
+
+        pushed = 0
+        suppressed = 0
+        suppress_reason = ''
+        advisor_verdicts_json = None
+
+        if advisor_decision:
+            pushed = 1 if advisor_decision.get('should_push') else 0
+            suppressed = 1 if advisor_decision.get('suppressed') else 0
+            reasons = advisor_decision.get('reasons') or []
+            suppress_reason = ' / '.join(reasons)[:500]
+            advisor_verdicts_json = json.dumps(
+                {'reasons': reasons, 'final_message': advisor_decision.get('final_message', '')},
+                ensure_ascii=False
+            )
+        else:
+            # TP/SL 信号不走 advisor，默认应推送
+            pushed = 1
+            suppressed = 0
+
+        context_json = json.dumps(context, ensure_ascii=True) if context else None
+
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO recommendation_journal
+                (stock_id, symbol, name, signal_type,
+                 trigger_price, entry_min, entry_max, take_profit, stop_loss,
+                 advisor_verdicts, pushed, suppressed, suppress_reason,
+                 context_snapshot)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            stock.get('id'), symbol, name, signal_type,
+            trigger_price, entry_min, entry_max, tp, sl,
+            advisor_verdicts_json, pushed, suppressed, suppress_reason,
+            context_json,
+        ))
+        record_id = cursor.lastrowid
+        conn.commit()
+        conn.close()
+        return record_id
 
 # 全局数据库实例
 monitor_db = StockMonitorDatabase()
