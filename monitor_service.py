@@ -52,7 +52,7 @@ class StockMonitorService:
         # 价格历史写入节流间隔（秒）
         self._history_throttle_seconds = 60
         # 快路径最大监测股数（与 monitor_db.upsert_with_ttl 的 max_pool 保持一致）
-        self._fast_poll_cap = 20
+        self._fast_poll_cap = 50
 
         # ============== 决策点（advisor 体系）==============
         # A 股行业缓存：A 股 → industry 字符串（如"半导体"、"化学制药"）。
@@ -68,6 +68,31 @@ class StockMonitorService:
         # 换手率缓存（ak.stock_zh_a_spot_em 全市场拉一次，缓存 5min）
         self._turnover_cache: dict = {'df': None, 'fetched_at': 0.0}
         self._turnover_ttl = int(os.getenv('AKSHARE_TURNOVER_CACHE_TTL_SECONDS', '300'))
+
+        # ============== 多 advisor 缓存 + env flag（2026-07-28 多策略集成）==============
+        # 技术指标缓存（_advisor_trend / _advisor_volume 共享一次 TDX 调用）
+        self._tech_indicators_cache: Dict[str, Dict] = {}
+        self._tech_indicators_ttl = int(os.getenv('TECH_INDICATORS_CACHE_TTL_SECONDS', '60'))
+
+        # 三重滤网评分缓存（_advisor_triple_screen）
+        self._triple_screen_cache: Dict[str, Dict] = {}
+        self._triple_screen_ttl = int(os.getenv('TRIPLE_SCREEN_CACHE_TTL_SECONDS', '60'))
+        self._triple_screen_timeout_seconds = float(os.getenv('TRIPLE_SCREEN_TIMEOUT_SECONDS', '2.0'))
+
+        # 大盘 regime 缓存（_advisor_market_regime）
+        # 全局共用：所有股票 30 分钟只算一次沪深 300 状态
+        self._market_regime_cache: dict = {'regime': 'NORMAL', 'fetched_at': 0.0}
+        self._market_regime_ttl = int(os.getenv('MARKET_REGIME_CACHE_TTL_SECONDS', '1800'))
+        self._market_regime_index = os.getenv('MARKET_REGIME_INDEX_SYMBOL', '000300')
+
+        # 6 个 env flag（每个 advisor 一键回退用）
+        # Phase 1 默认全开；Phase 2 默认禁用，需手动 .env 启用
+        self._enable_trading_session_filter = os.getenv('ENABLE_TRADING_SESSION_ENTRY_FILTER', 'true').lower() == 'true'
+        self._enable_trend_filter           = os.getenv('ENABLE_TREND_ENTRY_FILTER', 'true').lower() == 'true'
+        self._enable_volume_filter          = os.getenv('ENABLE_VOLUME_ENTRY_FILTER', 'true').lower() == 'true'
+        self._enable_position_filter        = os.getenv('ENABLE_POSITION_ENTRY_FILTER', 'true').lower() == 'true'
+        self._enable_triple_screen_filter   = os.getenv('ENABLE_TRIPLE_SCREEN_ENTRY_FILTER', 'true').lower() == 'true'
+        self._enable_market_regime_filter   = os.getenv('ENABLE_MARKET_REGIME_ENTRY_FILTER', 'true').lower() == 'true'
     
     def start_monitoring(self):
         """启动监测服务"""
@@ -155,7 +180,10 @@ class StockMonitorService:
             print(f"[news_flow] 检查预警异常: {e}")
     
     def _check_all_stocks(self):
-        """检查所有监测股票"""
+        """检查所有监测股票（非 TDX 回退路径，也受交易时段控制）"""
+        # 非交易时段跳过监测
+        if not self._is_trading_time_window():
+            return
         stocks = monitor_db.get_monitored_stocks()
         current_time = datetime.now()
         
@@ -189,14 +217,39 @@ class StockMonitorService:
         if updated_count > 0:
             print(f"✅ 本轮共更新了 {updated_count} 只股票")
 
+    @staticmethod
+    def _is_trading_time_window() -> bool:
+        """判断当前是否在 A 股交易时段窗口内（含 5 分钟缓冲）。"""
+        now = datetime.now()
+        # 非交易日
+        if now.weekday() + 1 not in (1, 2, 3, 4, 5):
+            return False
+        hm = now.strftime('%H:%M')
+        # 交易时段：09:25（集合竞价开始前一点）~ 15:05（收盘后留一点缓冲）
+        if '09:25' <= hm <= '15:05':
+            return True
+        # 午休也属于交易窗口（监测不停）
+        if '11:30' < hm < '13:00':
+            return True
+        return False
+
     def _fast_poll_tdx(self):
         """TDX 秒级快路径：每秒轮询所有 A 股监测股票。
 
-        - 通过 monitor_db.get_a_share_stocks_for_fast_poll 拉取未过期、A股、按 expires_at 排序、上限 20 只
+        - 通过 monitor_db.get_a_share_stocks_for_fast_poll 拉取未过期、A股、按 expires_at 排序、上限 50 只
         - 逐只调 TDX 拉价 + 触发条件检查
         - price_history 由 _update_stock_price_fast 按 60s 节流
         - 单只失败不影响其他股票
+        - 批量时间预算 8 秒：超时则跳过剩余股票（防止某只卡住拖垮整轮）
+        - 首轮缓存全空时（重启后第一次扫描），Phase 2 advisor 走 fallback，避免主循环被卡
+
+        容量注释（2026-07-29）：
+            上限从 20 提到 50。本地 TDX 单次请求 <50ms，50 只约 2~3 秒完成整轮。
+            8 秒预算作为安全网，后续按需可调。
         """
+        # 非交易时段跳过监测，不推送任何通知
+        if not self._is_trading_time_window():
+            return
         try:
             stocks = monitor_db.get_a_share_stocks_for_fast_poll(cap=self._fast_poll_cap)
         except Exception as e:
@@ -206,9 +259,22 @@ class StockMonitorService:
         if not stocks:
             return
 
-        for stock in stocks:
+        # 首轮检测：缓存为空时临时禁用 Phase 2 advisor
+        # Phase 2 advisor 内部自行检查 _tech_indicators_cache 长度，这里无需传递
+
+        batch_start = time.time()
+        max_batch_dur = 8.0  # 整轮最多 8 秒，超时跳过剩余
+
+        for idx, stock in enumerate(stocks):
             if not stock.get('notification_enabled', True):
                 continue
+
+            # 批量时间预算检查
+            if time.time() - batch_start > max_batch_dur:
+                skipped = len(stocks) - idx
+                print(f"[fast_poll] 本轮已达时间预算 ({max_batch_dur}s)，跳过剩余 {skipped} 只")
+                break
+
             try:
                 self._update_stock_price_fast(stock)
             except Exception as e:
@@ -340,10 +406,16 @@ class StockMonitorService:
                         f"价格 {current_price} 进入进场区间 "
                         f"[{entry_range['min']}-{entry_range['max']}]"
                     )
-                    decision = self._evaluate_entry_decision(stock, 'entry', base_msg)
+                    decision = self._evaluate_entry_decision(stock, 'entry', base_msg, ctx=ctx)
 
                     # 总是写 notifications（抑制也写，方便 UI 追溯）
                     monitor_db.add_notification(stock['id'], 'entry', decision['final_message'], context=ctx)
+
+                    # 📝 记录操盘策略日志（永久归档，用于后续复盘对比）
+                    monitor_db.record_recommendation(
+                        stock, 'entry', current_price,
+                        advisor_decision=decision, context=ctx,
+                    )
 
                     # 未被抑制时才推 DingTalk
                     if decision['should_push']:
@@ -358,14 +430,20 @@ class StockMonitorService:
                             f"[advisor] {stock['symbol']} 入场已抑制: "
                             f"{' / '.join(decision['reasons']) or '(no reason)'}"
                         )
-        
+
         # 检查止盈
         if take_profit and current_price >= take_profit:
             # 检查是否在最近60分钟内已发送过相同通知，避免重复
             if not monitor_db.has_recent_notification(stock['id'], 'take_profit', minutes=60):
                 message = f"股票 {stock['symbol']} ({stock['name']}) 价格 {current_price} 达到止盈位 {take_profit}"
                 monitor_db.add_notification(stock['id'], 'take_profit', message, context=ctx)
-                
+
+                # 📝 记录操盘策略日志
+                monitor_db.record_recommendation(
+                    stock, 'take_profit', current_price,
+                    advisor_decision=None, context=ctx,
+                )
+
                 # 立即发送通知（包括邮件）
                 notification_service.send_notifications()
             
@@ -379,7 +457,13 @@ class StockMonitorService:
             if not monitor_db.has_recent_notification(stock['id'], 'stop_loss', minutes=60):
                 message = f"股票 {stock['symbol']} ({stock['name']}) 价格 {current_price} 达到止损位 {stop_loss}"
                 monitor_db.add_notification(stock['id'], 'stop_loss', message, context=ctx)
-                
+
+                # 📝 记录操盘策略日志
+                monitor_db.record_recommendation(
+                    stock, 'stop_loss', current_price,
+                    advisor_decision=None, context=ctx,
+                )
+
                 # 立即发送通知（包括邮件）
                 notification_service.send_notifications()
             
@@ -528,7 +612,8 @@ class StockMonitorService:
 
     # ============== 决策点 + Advisor 体系（A 方案，可扩展 B/C） ==============
 
-    def _evaluate_entry_decision(self, stock: Dict, signal_type: str, base_message: str) -> Dict:
+    def _evaluate_entry_decision(self, stock: Dict, signal_type: str, base_message: str,
+                                  ctx: Optional[Dict] = None) -> Dict:
         """
         入场信号的最终推送决策点。
 
@@ -558,10 +643,17 @@ class StockMonitorService:
             }
 
         advisors = [
-            self._advisor_news_flow(stock),
+            # 顺序：suppress 闸门放前，warn 闸门放后（主流程已有短路逻辑）
+            # Phase 1（默认启用）
+            self._advisor_trading_session(stock, ctx),  # 闸门 #1
+            self._advisor_news_flow(stock),             # 已存在
+            self._advisor_trend(stock),                 # 闸门 #2
+            self._advisor_volume(stock),                # 闸门 #3
+            self._advisor_position(stock, ctx),          # 闸门 #6
+            # Phase 2（默认禁用，env flag 控制）
+            self._advisor_triple_screen(stock),          # 闸门 #4
+            self._advisor_market_regime(stock),          # 闸门 #5
         ]
-        # future:
-        # advisors.append(self._advisor_agents_realtime(stock, current_price))
 
         reasons: list[str] = []
         final_message = base_message
@@ -726,6 +818,433 @@ class StockMonitorService:
             print(f"[advisor_news_flow] 查询预警失败: {e}")
             # 失败时返回旧缓存（可能为空），保守不抑制
             return self._news_flow_cache.get('alerts', [])
+
+    # ============== 多策略 advisor 体系（2026-07-28 集成）==============
+    #
+    # 设计原则：
+    # 1. 每个 advisor 返回 {'source', 'decision': 'pass'|'warn'|'suppress', 'reason'}
+    # 2. 失败一律兜底 'pass'（宁可漏不可错）
+    # 3. 每个 advisor 第一行检查 env flag，flag 关闭时直接返回 pass
+    # 4. suppress 闸门挂前面，warn 闸门挂后面（主流程已有短路逻辑）
+
+    def _advisor_trading_session(self, stock: Dict, ctx: Dict) -> Dict:
+        """#1 交易时段拦截（盘前/午休/14:55后/已收盘/非交易日 → suppress）
+
+        来源：docs/智能盯盘交易时段优化说明.md + docs/智能盯盘配置说明.md
+        数据：ctx['trading_session']（_build_notification_context 已写入）+ 当前时间精确判断 14:55
+        """
+        if not self._enable_trading_session_filter:
+            return {'source': 'trading_session', 'decision': 'pass', 'reason': 'filter disabled'}
+
+        session = (ctx or {}).get('trading_session')
+        if not session:
+            return {'source': 'trading_session', 'decision': 'pass', 'reason': 'no session info, fallback'}
+
+        # 14:55 之后尾盘不再推 entry（智能盯盘文档明确）
+        now = datetime.now()
+        hm = now.strftime('%H:%M')
+        if hm >= '14:55' and hm <= '15:00':
+            return {
+                'source': 'trading_session',
+                'decision': 'suppress',
+                'reason': '尾盘最后 5 分钟不推入场（波动大，谨慎操作）',
+            }
+
+        if session in ('上午交易', '下午交易'):
+            return {'source': 'trading_session', 'decision': 'pass', 'reason': f'{session}时段'}
+
+        # 其他时段：盘前 / 午休 / 已收盘 / 非交易日
+        return {
+            'source': 'trading_session',
+            'decision': 'suppress',
+            'reason': f'非交易时段（{session}），不推入场',
+        }
+
+    def _advisor_position(self, stock: Dict, ctx: Dict) -> Dict:
+        """#6 持仓感知（已浮盈 +5% → suppress：这是加仓信号非首次入场）
+
+        来源：docs/智能盯盘持仓管理功能说明.md
+        数据：ctx['position_status'] / ctx['profit_loss_pct']
+        """
+        if not self._enable_position_filter:
+            return {'source': 'position', 'decision': 'pass', 'reason': 'filter disabled'}
+
+        position_status = (ctx or {}).get('position_status')
+        profit_loss_pct = (ctx or {}).get('profit_loss_pct')
+
+        # 未持仓 → pass
+        if not position_status or position_status == '未持仓':
+            return {'source': 'position', 'decision': 'pass', 'reason': '未持仓'}
+
+        # 浮盈 > +5% → suppress（加仓场景，走加仓/分批止盈路径）
+        if profit_loss_pct is not None and profit_loss_pct > 5:
+            return {
+                'source': 'position',
+                'decision': 'suppress',
+                'reason': f'已浮盈 +{profit_loss_pct:.1f}%，非首次入场信号',
+            }
+
+        # 亏损 -5%~0% → warn（加仓时机不成熟，先看止跌）
+        if profit_loss_pct is not None and profit_loss_pct < 0:
+            return {
+                'source': 'position',
+                'decision': 'warn',
+                'reason': f'微亏 {profit_loss_pct:.1f}%，加仓时机不成熟',
+            }
+
+        # 其它情况（持仓盈利 0-5%）→ pass
+        return {'source': 'position', 'decision': 'pass', 'reason': position_status}
+
+    def _get_cached_tech_indicators(self, symbol: str) -> Optional[Dict]:
+        """共享 helper：拉 TDX 技术指标，带 60s 缓存。
+
+        失败兜底返回 None（advisor 自己负责 fallback）。
+        """
+        now = time.time()
+        cached = self._tech_indicators_cache.get(symbol)
+        if cached and (now - cached.get('fetched_at', 0)) < self._tech_indicators_ttl:
+            return cached.get('data')
+
+        try:
+            if self.use_tdx and self._is_a_stock(symbol):
+                data = self.tdx_fetcher.get_technical_indicators(symbol)
+                if data:
+                    self._tech_indicators_cache[symbol] = {
+                        'data': data,
+                        'fetched_at': now,
+                    }
+                    return data
+        except Exception as e:
+            print(f"[tech_indicators] {symbol} TDX 拉取失败: {e}")
+        return None
+
+    def _advisor_trend(self, stock: Dict) -> Dict:
+        """#2 趋势方向门（trend=down → suppress；sideways → warn；up → pass）
+
+        来源：docs/智能盯盘使用指南.md L145
+        数据：TDX get_technical_indicators() 返回的 trend 字段
+        """
+        if not self._enable_trend_filter:
+            return {'source': 'trend', 'decision': 'pass', 'reason': 'filter disabled'}
+
+        symbol = stock.get('symbol', '')
+        if not symbol:
+            return {'source': 'trend', 'decision': 'pass', 'reason': 'no symbol'}
+
+        indicators = self._get_cached_tech_indicators(symbol)
+        if not indicators:
+            return {'source': 'trend', 'decision': 'pass', 'reason': 'indicators unavailable, fallback'}
+
+        trend = indicators.get('trend')
+        if trend == 'up':
+            return {'source': 'trend', 'decision': 'pass', 'reason': '趋势向上'}
+        if trend == 'sideways':
+            return {
+                'source': 'trend',
+                'decision': 'warn',
+                'reason': '趋势不明朗（横盘），建议小仓位试探',
+            }
+        if trend == 'down':
+            return {
+                'source': 'trend',
+                'decision': 'suppress',
+                'reason': '趋势向下，建议回避',
+            }
+        return {'source': 'trend', 'decision': 'pass', 'reason': f'trend={trend}, fallback'}
+
+    def _advisor_volume(self, stock: Dict) -> Dict:
+        """#3 量能确认（volume_ratio < 1.2 → warn；>= 1.2 → pass；永不 suppress）
+
+        来源：docs/智能盯盘使用指南.md L148
+        数据：TDX get_technical_indicators() 返回的 volume_ratio 字段
+        """
+        if not self._enable_volume_filter:
+            return {'source': 'volume', 'decision': 'pass', 'reason': 'filter disabled'}
+
+        symbol = stock.get('symbol', '')
+        if not symbol:
+            return {'source': 'volume', 'decision': 'pass', 'reason': 'no symbol'}
+
+        indicators = self._get_cached_tech_indicators(symbol)
+        if not indicators:
+            return {'source': 'volume', 'decision': 'pass', 'reason': 'indicators unavailable, fallback'}
+
+        ratio = indicators.get('volume_ratio')
+        if ratio is None:
+            return {'source': 'volume', 'decision': 'pass', 'reason': 'no volume_ratio, fallback'}
+
+        if ratio >= 1.2:
+            return {'source': 'volume', 'decision': 'pass', 'reason': f'放量（量比 {ratio:.2f}）'}
+        if ratio >= 1.0:
+            return {
+                'source': 'volume',
+                'decision': 'warn',
+                'reason': f'量能一般（量比 {ratio:.2f}），建议观察',
+            }
+        return {
+            'source': 'volume',
+            'decision': 'warn',
+            'reason': f'缩量上攻（量比 {ratio:.2f}），警惕诱多',
+        }
+
+    # ============== Phase 2: 三重滤网 + 大盘 regime ==============
+
+    @staticmethod
+    def _calculate_ema(data, period: int):
+        """EMA 指数移动平均（移植自 docs/三重滤网策略保存.py calculate_ema）"""
+        import numpy as np
+        ema = np.zeros(len(data))
+        ema[0] = data[0]
+        multiplier = 2 / (period + 1)
+        for i in range(1, len(data)):
+            ema[i] = (data[i] - ema[i-1]) * multiplier + ema[i-1]
+        return ema
+
+    @staticmethod
+    def _calculate_macd(close, fast: int = 12, slow: int = 26, signal: int = 9):
+        """MACD（移植自 docs/三重滤网策略保存.py calculate_macd）
+
+        返回 (dif, dea, macd_hist)
+        """
+        import numpy as np
+        ema_fast = StockMonitorService._calculate_ema(close, fast)
+        ema_slow = StockMonitorService._calculate_ema(close, slow)
+        dif = ema_fast - ema_slow
+        dea = StockMonitorService._calculate_ema(dif, signal)
+        macd = (dif - dea) * 2
+        return dif, dea, macd
+
+    @staticmethod
+    def _calculate_rsi(close, period: int = 14):
+        """RSI（移植自 docs/三重滤网策略保存.py calculate_rsi）"""
+        import numpy as np
+        delta = np.diff(close)
+        gain = np.where(delta > 0, delta, 0)
+        loss = np.where(delta < 0, -delta, 0)
+        avg_gain = np.zeros(len(delta))
+        avg_loss = np.zeros(len(delta))
+        avg_gain[period-1] = np.mean(gain[:period])
+        avg_loss[period-1] = np.mean(loss[:period])
+        for i in range(period, len(delta)):
+            avg_gain[i] = (avg_gain[i-1] * (period-1) + gain[i]) / period
+            avg_loss[i] = (avg_loss[i-1] * (period-1) + loss[i]) / period
+        rs = avg_gain / (avg_loss + 1e-10)
+        rsi = 100 - 100 / (1 + rs)
+        return rsi
+
+    @staticmethod
+    def _calculate_kdj(high, low, close, n: int = 9, m1: int = 3, m2: int = 3):
+        """KDJ（移植自 docs/三重滤网策略保存.py calculate_kdj）
+
+        返回 (k, d, j) 三个序列
+        """
+        import numpy as np
+        length = len(close)
+        rsv = np.zeros(length)
+        k = np.zeros(length)
+        d = np.zeros(length)
+        j = np.zeros(length)
+        for i in range(n-1, length):
+            hn = np.max(high[i-n+1:i+1])
+            ln = np.min(low[i-n+1:i+1])
+            rsv[i] = (close[i] - ln) / (hn - ln + 1e-10) * 100
+        k[n-1] = 50
+        d[n-1] = 50
+        for i in range(n, length):
+            k[i] = (m1-1)/m1 * k[i-1] + 1/m1 * rsv[i]
+            d[i] = (m2-1)/m2 * d[i-1] + 1/m2 * k[i]
+            j[i] = 3 * k[i] - 2 * d[i]
+        return k, d, j
+
+    def _advisor_triple_screen(self, stock: Dict) -> Dict:
+        """#4 三重滤网评分（score < 40 → suppress；40-60 → warn；>= 60 → pass）
+
+        规则来源：docs/三重滤网策略保存.py check_triple_screen（L96-203 简化版）
+        数据：TDX get_kline_data(symbol, 'day', 200) → 计算 MACD/RSI/KDJ/MA
+        默认禁用（env: ENABLE_TRIPLE_SCREEN_ENTRY_FILTER=false）
+        """
+        if not self._enable_triple_screen_filter:
+            return {'source': 'triple_screen', 'decision': 'pass', 'reason': 'filter disabled'}
+
+        # 首轮保护：缓存全空（重启后第一次扫描）时跳过，避免 20 只 × 拉 K 线卡主循环
+        if len(self._tech_indicators_cache) == 0:
+            return {'source': 'triple_screen', 'decision': 'pass', 'reason': 'phase 2 warming up'}
+
+        symbol = stock.get('symbol', '')
+        if not symbol:
+            return {'source': 'triple_screen', 'decision': 'pass', 'reason': 'no symbol'}
+
+        # 缓存命中
+        now = time.time()
+        cached = self._triple_screen_cache.get(symbol)
+        if cached and (now - cached.get('fetched_at', 0)) < self._triple_screen_ttl:
+            return cached['verdict']
+
+        try:
+            import pandas as pd
+            import numpy as np
+
+            if not (self.use_tdx and self._is_a_stock(symbol)):
+                return {'source': 'triple_screen', 'decision': 'pass', 'reason': 'non-A-stock'}
+
+            df = self.tdx_fetcher.get_kline_data(symbol, kline_type='day', limit=200)
+            if df is None or len(df) < 60:
+                return {'source': 'triple_screen', 'decision': 'pass', 'reason': 'insufficient kline'}
+
+            # TDX 返回列名：日期/开盘/收盘/最高/最低/成交量
+            close = df['收盘'].astype(float).values
+            high = df['最高'].astype(float).values
+            low = df['最低'].astype(float).values
+
+            score = 0
+            details = []
+
+            # 第一重：MACD 多头（30 分）
+            dif, dea, macd_hist = self._calculate_macd(close)
+            if dif[-1] > dea[-1] and dif[-1] > 0:
+                score += 30
+                details.append('MACD多头')
+            else:
+                details.append(f'MACD非多头(DIF={dif[-1]:.3f},DEA={dea[-1]:.3f})')
+
+            # 第二重：RSI/KDJ 不极端超买（30 分）
+            rsi6_series = self._calculate_rsi(close, 6)
+            k_arr, d_arr, j_arr = self._calculate_kdj(high, low, close)
+            rsi6 = rsi6_series[-1] if len(rsi6_series) > 0 else 50
+            j_val = j_arr[-1]
+            if rsi6 < 75 and j_val < 90:
+                score += 30
+                details.append(f'RSI6={rsi6:.1f},J={j_val:.1f}')
+            else:
+                details.append(f'RSI6={rsi6:.1f},J={j_val:.1f} 超买')
+
+            # 第三重：价格在 MA5 ±3%（40 分）
+            ma5 = float(np.mean(close[-5:]))
+            current_price = float(close[-1])
+            distance = abs(current_price - ma5) / ma5
+            if distance <= 0.03:
+                score += 40
+                details.append(f'价格距MA5 {distance*100:.1f}%')
+            else:
+                details.append(f'价格距MA5 {distance*100:.1f}%超阈值')
+
+            # 评分映射
+            if score < 40:
+                verdict = {
+                    'source': 'triple_screen',
+                    'decision': 'suppress',
+                    'reason': f'三重滤网评分{score}（{" / ".join(details)}），不适合入场',
+                }
+            elif score < 60:
+                verdict = {
+                    'source': 'triple_screen',
+                    'decision': 'warn',
+                    'reason': f'三重滤网评分{score}（{" / ".join(details)}），建议谨慎',
+                }
+            else:
+                verdict = {
+                    'source': 'triple_screen',
+                    'decision': 'pass',
+                    'reason': f'三重滤网评分{score}（{" / ".join(details)}）',
+                }
+
+            self._triple_screen_cache[symbol] = {
+                'verdict': verdict,
+                'fetched_at': now,
+            }
+            return verdict
+
+        except Exception as e:
+            print(f"[advisor_triple_screen] {symbol} 计算失败: {e}")
+            return {'source': 'triple_screen', 'decision': 'pass', 'reason': f'fallback: {type(e).__name__}'}
+
+    def _advisor_market_regime(self, stock: Dict) -> Dict:
+        """#5 大盘 regime 闸门（沪深 300 极端熊市 → suppress entry）
+
+        规则来源：docs/均线回归策略保存.py market_analysis（L70-117）
+        数据：沪深 300（000300）日线 130 根 → 计算 MA20/MA60/MA120 + 5日/10日跌幅
+        默认禁用（env: ENABLE_MARKET_REGIME_ENTRY_FILTER=false）
+        全局共享：30 分钟只算一次，所有股票共用 verdict
+        """
+        if not self._enable_market_regime_filter:
+            return {'source': 'market_regime', 'decision': 'pass', 'reason': 'filter disabled'}
+
+        # 首轮保护（与 _advisor_triple_screen 相同的逻辑）
+        if len(self._tech_indicators_cache) == 0:
+            return {'source': 'market_regime', 'decision': 'pass', 'reason': 'phase 2 warming up'}
+
+        # 缓存命中（全局共享，不分 symbol）
+        now = time.time()
+        cache_age = now - self._market_regime_cache['fetched_at']
+        if cache_age < self._market_regime_ttl and self._market_regime_cache.get('regime') != 'NORMAL_INIT':
+            cached_verdict = self._market_regime_cache.get('verdict')
+            if cached_verdict:
+                return cached_verdict
+
+        try:
+            import numpy as np
+
+            # 尝试用 TDX 拉沪深 300；不支持则降级 akshare stock_zh_index_daily
+            df = None
+            if self.use_tdx:
+                try:
+                    df = self.tdx_fetcher.get_kline_data(
+                        self._market_regime_index, kline_type='day', limit=130
+                    )
+                except Exception:
+                    df = None
+
+            if df is None or (hasattr(df, 'empty') and df.empty) or len(df) < 120:
+                # 降级到 akshare 指数日线
+                try:
+                    import akshare as ak
+                    df = ak.stock_zh_index_daily(symbol='sh000300')
+                    if df is None or len(df) < 120:
+                        raise ValueError('akshare 返回数据不足')
+                except Exception as e2:
+                    print(f"[advisor_market_regime] 拉沪深 300 失败: {e2}")
+                    return {'source': 'market_regime', 'decision': 'pass', 'reason': 'index unavailable, fallback'}
+
+            # 列名兼容：TDX 中文 / akshare 英文
+            close_col = '收盘' if '收盘' in df.columns else 'close'
+            close = df[close_col].astype(float).values
+            current = float(close[-1])
+            ma20 = float(np.mean(close[-20:]))
+            ma60 = float(np.mean(close[-60:]))
+            ma120 = float(np.mean(close[-120:]))
+            change_5d = (close[-1] - close[-6]) / close[-6] if len(close) >= 6 else 0
+            change_10d = (close[-1] - close[-11]) / close[-11] if len(close) >= 11 else 0
+
+            # 极端熊市：跌破 120 日均线 + 均线空头 + 10 日跌幅 > 8%
+            if current < ma120 and ma20 < ma60 < ma120 and change_10d < -0.08:
+                verdict = {
+                    'source': 'market_regime',
+                    'decision': 'suppress',
+                    'reason': f'大盘极端熊市（10日 {change_10d*100:.1f}%，均线空头），全局不入场',
+                }
+            elif change_5d < -0.08:
+                verdict = {
+                    'source': 'market_regime',
+                    'decision': 'suppress',
+                    'reason': f'大盘短期暴跌（5日 {change_5d*100:.1f}%），全局不入场',
+                }
+            else:
+                verdict = {
+                    'source': 'market_regime',
+                    'decision': 'pass',
+                    'reason': f'大盘正常（5日 {change_5d*100:+.1f}%，10日 {change_10d*100:+.1f}%）',
+                }
+
+            self._market_regime_cache = {
+                'regime': 'BEAR' if verdict['decision'] == 'suppress' else 'NORMAL',
+                'verdict': verdict,
+                'fetched_at': now,
+            }
+            return verdict
+
+        except Exception as e:
+            print(f"[advisor_market_regime] 计算失败: {e}")
+            return {'source': 'market_regime', 'decision': 'pass', 'reason': f'fallback: {type(e).__name__}'}
 
     def _execute_quant_trade(self, stock: Dict, signal_type: str, current_price: float):
         """执行量化交易"""
