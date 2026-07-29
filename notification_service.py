@@ -56,6 +56,8 @@ class NotificationService:
             config['webhook_keyword'] = os.getenv('WEBHOOK_KEYWORD')
         if os.getenv('NEWS_FLOW_WEBHOOK_URL'):
             config['news_flow_webhook_url'] = os.getenv('NEWS_FLOW_WEBHOOK_URL')
+        if os.getenv('LONGHUBANG_WEBHOOK_URL'):
+            config['longhubang_webhook_url'] = os.getenv('LONGHUBANG_WEBHOOK_URL')
 
         return config
     
@@ -201,6 +203,24 @@ class NotificationService:
             print("[新闻流量] 未配置 NEWS_FLOW_WEBHOOK_URL，跳过推送")
             return False
         return self._send_dingtalk_markdown(news_flow_url, '新闻流量分析', subject, content)
+
+    def send_longhubang_message(self, subject: str, content: str) -> bool:
+        """
+        向龙虎榜专用 Webhook 推送消息。
+        供 longhubang_daily_push.py 盘后全量推送使用。
+
+        Args:
+            subject: 消息主题
+            content: 消息正文（已格式化的 markdown）
+
+        Returns:
+            bool: 是否推送成功
+        """
+        url = self.config.get('longhubang_webhook_url', '')
+        if not url:
+            print("[龙虎榜] 未配置 LONGHUBANG_WEBHOOK_URL，跳过推送")
+            return False
+        return self._send_dingtalk_markdown(url, '龙虎榜', subject, content)
 
     def _send_email_notification(self, notification: Dict) -> bool:
         """发送邮件通知"""
