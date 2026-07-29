@@ -38,22 +38,29 @@ INDICES = [
 ]
 
 # 美股 AI 头部公司（按业务板块分组，直接影响 A 股对应板块情绪）
+# 每组至少 3 只，确保板块代表性
 AI_STOCKS = {
     'AI芯片': [
         {'symbol': 'NVDA',  'name': '英伟达',   'alias': 'NVIDIA'},
         {'symbol': 'AMD',   'name': '超威',      'alias': 'AMD'},
+        {'symbol': 'AVGO',  'name': '博通',      'alias': 'Broadcom'},
+        {'symbol': 'INTC',  'name': '英特尔',    'alias': 'Intel'},
     ],
     '存储芯片': [
         {'symbol': 'MU',    'name': '美光',      'alias': 'Micron'},
+        {'symbol': 'WDC',   'name': '西部数据',  'alias': 'Western Digital/SanDisk'},
+        {'symbol': 'STX',   'name': '希捷',      'alias': 'Seagate'},
     ],
     'AI云平台': [
         {'symbol': 'MSFT',  'name': '微软',      'alias': 'Microsoft'},
         {'symbol': 'GOOGL', 'name': '谷歌',      'alias': 'Alphabet'},
         {'symbol': 'META',  'name': 'Meta',      'alias': 'Meta'},
+        {'symbol': 'AMZN',  'name': '亚马逊',    'alias': 'Amazon AWS'},
     ],
-    '半导体代工/设备': [
-        {'symbol': 'AVGO',  'name': '博通',      'alias': 'Broadcom'},
-        {'symbol': 'TSM',   'name': '台积电',    'alias': 'TSMC ADR'},
+    '半导体设备/代工': [
+        {'symbol': 'TSM',   'name': '台积电',    'alias': 'TSMC'},
+        {'symbol': 'ASML',  'name': '阿斯麦',    'alias': 'ASML'},
+        {'symbol': 'AMAT',  'name': '应用材料',  'alias': 'Applied Materials'},
     ],
 }
 
@@ -101,7 +108,7 @@ def _fetch_single(symbol: str, name: str, retries: int = 2) -> Optional[Dict]:
                 'open': round(last['Open'], 2),
                 'high': round(last['High'], 2),
                 'low': round(last['Low'], 2),
-                'change_pct': change_pct,
+                'change_pct': change_pct if not (change_pct is None or change_pct != change_pct) else 0.0,
                 'volume': int(last['Volume']) if 'Volume' in hist.columns else 0,
             }
         except Exception as e:
@@ -221,7 +228,7 @@ def format_overseas_snapshot_md(data: Dict) -> str:
     if indices:
         lines.append("### 🇺🇸 美股指数")
         for idx in indices:
-            chg = idx.get('change_pct', 0)
+            chg = idx.get('change_pct', 0) or 0
             emoji = '🔴' if chg >= 0 else '🟢'
             arrow = '↑' if chg >= 0 else '↓'
             lines.append(
@@ -241,7 +248,7 @@ def format_overseas_snapshot_md(data: Dict) -> str:
             first = False
             lines.append(f"  **{group_name}**")
             for s in group_items:
-                chg = s.get('change_pct', 0)
+                chg = s.get('change_pct', 0) or 0  # None/nan 兜底
                 emoji = '🔴' if chg >= 0 else '🟢'
                 arrow = '↑' if chg >= 0 else '↓'
                 lines.append(
@@ -254,7 +261,7 @@ def format_overseas_snapshot_md(data: Dict) -> str:
     if kr_semicon:
         lines.append("### 🇰🇷 韩股半导体")
         for s in kr_semicon:
-            chg = s.get('change_pct', 0)
+            chg = s.get('change_pct', 0) or 0
             emoji = '🔴' if chg >= 0 else '🟢'
             arrow = '↑' if chg >= 0 else '↓'
             lines.append(
