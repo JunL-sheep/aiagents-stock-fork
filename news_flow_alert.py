@@ -5,6 +5,7 @@
 import logging
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
+from stock_keyword_map import find_sectors_by_keyword, stocks_for_sector
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -165,6 +166,31 @@ class NewsFlowAlertSystem:
         alerts.sort(key=lambda x: self.ALERT_LEVELS.get(
             x.get('alert_level', 'info'), {}
         ).get('priority', 0), reverse=True)
+        
+        # ── 为预警补充板块/话题上下文（让推送消息更精确） ──
+        hot_topics = current_data.get('hot_topics', [])
+        if hot_topics and alerts:
+            # 把热门话题映射到 A 股板块
+            topic_text = ' '.join([t.get('topic', '') for t in hot_topics[:10]])
+            hot_sectors = find_sectors_by_keyword(topic_text)
+            
+            # 拉最新的 AI 板块分析（每 2h 的 deep_analysis 产物）
+            ai_sectors = []
+            ai_risk_factors = []
+            if self.db:
+                try:
+                    ai = self.db.get_latest_ai_analysis()
+                    if ai:
+                        ai_sectors = ai.get('affected_sectors', [])[:5]
+                        ai_risk_factors = ai.get('risk_factors', [])[:3]
+                except Exception:
+                    pass
+            
+            for alert in alerts:
+                alert['hot_topics'] = hot_topics[:5]
+                alert['mapped_sectors'] = hot_sectors[:5]
+                alert['ai_sectors'] = ai_sectors
+                alert['ai_risk_factors'] = ai_risk_factors
         
         # 保存预警到数据库
         if self.db and alerts:
@@ -362,39 +388,130 @@ class NewsFlowAlertSystem:
             return False
         
         try:
-            # 按级别分组
-            danger_alerts = [a for a in alerts if a.get('alert_level') == 'danger']
-            warning_alerts = [a for a in alerts if a.get('alert_level') == 'warning']
-            info_alerts = [a for a in alerts if a.get('alert_level') == 'info']
-            
-            # 构建通知内容
-            lines = []
-            lines.append("📊 新闻流量预警通知")
-            lines.append(f"时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+            lines = []  # 初始化消息行列表
+            # ── 预警区块（危险/警告/提示），带详细内容 ──
+            for level, label in [
+                ('danger', '🔴 【危险预警】'),
+                ('warning', '🟠 【警告】'),
+                ('info', '🔵 【提示】'),
+            ]:
+                filtered = [a for a in alerts if a.get('alert_level') == level]
+                if not filtered:
+                    continue
+                lines.append(label)
+                for alert in filtered:
+                    lines.append(f"  ▸ **{alert['title']}**")
+                    a_content = alert.get('content', '')
+                    if a_content:
+                        for a_line in a_content.split('\n'):
+                            a_line = a_line.strip()
+                            if a_line:
+                                lines.append(f"    {a_line}")
+                lines.append("")
+
+            # ── 上下文数据（从第一个预警取，同批次共享） ──
+            hot_topics = mapped_sectors = ai_sectors = ai_risk_factors = []
+            if alerts:
+                hot_topics = alerts[0].get('hot_topics', []) or []
+                mapped_sectors = alerts[0].get('mapped_sectors', []) or []
+                ai_sectors = alerts[0].get('ai_sectors', []) or []
+                ai_risk_factors = alerts[0].get('ai_risk_factors', []) or []
+                # 如果预警是从DB直取的（缺上下文），尝试从 engine 补充
+                if not hot_topics and not ai_sectors:
+                    try:
+                        from stock_keyword_map import find_sectors_by_keyword
+                        from news_flow_db import news_flow_db as nf_db
+                        if nf_db:
+                            latest = nf_db.get_latest_snapshot()
+                            if latest and 'hot_topics' in latest:
+                                hot_topics = latest['hot_topics'][:5]
+                                topic_text = ' '.join(t.get('topic','') for t in hot_topics)
+                                mapped_sectors = find_sectors_by_keyword(topic_text)[:5]
+                            ai = nf_db.get_latest_ai_analysis()
+                            if ai:
+                                ai_sectors = ai.get('affected_sectors', [])[:5]
+                                ai_risk_factors = ai.get('risk_factors', [])[:3]
+                    except Exception:
+                        pass
+
+            # 🔥 当前热点 → 板块映射
+            if hot_topics:
+                lines.append("🔥 **当前市场热点**")
+                for t in hot_topics[:5]:
+                    topic = t.get('topic', '')
+                    heat = t.get('heat', '')
+                    matched = find_sectors_by_keyword(topic)
+                    sector_str = f" → {matched[0][0]}" if matched else ""
+                    lines.append(f"  • {topic} (热度 {heat}){sector_str}")
+                lines.append("")
+
+            # 📌 AI 板块影响（利好/利空 + 关联个股）
+            if ai_sectors:
+                lines.append("📌 **板块影响（AI分析）**")
+                for s in ai_sectors:
+                    name = s.get('name', '')
+                    impact = s.get('impact', '')
+                    conf = s.get('confidence', '')
+                    reason = s.get('reason', '')
+                    emoji = {'利好': '🟢', '利空': '🔴'}.get(impact, '⚪')
+                    sector_stocks = stocks_for_sector(name)
+                    stock_list = '、'.join(
+                        f"{n}({c})" for c, n, _ in sector_stocks[:3]
+                    )
+                    lines.append(f"  {emoji} **{name}** — {impact} (置信度 {conf}%)")
+                    if reason:
+                        lines.append(f"    {reason[:120]}")
+                    if stock_list:
+                        lines.append(f"    关联个股：{stock_list}")
+                lines.append("")
+
+            # ⚠️ 风险因素
+            if ai_risk_factors:
+                lines.append("⚠️ **风险因素**")
+                for f in ai_risk_factors[:3]:
+                    if isinstance(f, dict):
+                        text = f.get('factor', '') or f.get('text', '') or str(f)
+                    else:
+                        text = str(f)
+                    if text:
+                        lines.append(f"  • {text[:120]}")
+                lines.append("")
+
+            # 💡 操作参考 — 根据预警级别给出不同粒度的建议
+            has_danger = any(a.get('alert_level') == 'danger' for a in alerts)
+            has_warning = any(a.get('alert_level') == 'warning' for a in alerts)
+            lines.append("💡 **操作参考**")
+            if has_danger:
+                lines.append("  🔴 市场情绪过热/题材见顶信号明确")
+                if ai_sectors:
+                    bad = [s for s in ai_sectors if s.get('impact') == '利空']
+                    good = [s for s in ai_sectors if s.get('impact') == '利好']
+                    if bad:
+                        names = '、'.join(s['name'] for s in bad[:3])
+                        lines.append(f"  ⚠️ 利空板块（减仓/回避）：{names}")
+                    if good:
+                        names = '、'.join(s['name'] for s in good[:3])
+                        lines.append(f"  🟢 利好/防御板块（可持有）：{names}")
+                else:
+                    lines.append("  ⚠️ 建议：整体减仓，前期涨幅大的题材股注意止盈")
+                lines.append("  📌 防御板块（医药、公用事业、消费）受影响有限，不必恐慌清仓")
+            elif has_warning:
+                lines.append("  🟠 市场出现异常信号，需要关注")
+                if ai_sectors:
+                    bad = [s for s in ai_sectors if s.get('impact') == '利空']
+                    if bad:
+                        names = '、'.join(s['name'] for s in bad[:3])
+                        lines.append(f"  ⚠️ 关注以下板块风险：{names}")
+                lines.append("  📌 检查持仓是否在热点板块，不在则无需过度反应")
+            else:
+                lines.append("  🔵 信息性提示，暂无需操作")
             lines.append("")
-            
-            if danger_alerts:
-                lines.append("🔴 【危险预警】")
-                for alert in danger_alerts:
-                    lines.append(f"  • {alert['title']}")
-                lines.append("")
-            
-            if warning_alerts:
-                lines.append("🟠 【警告】")
-                for alert in warning_alerts:
-                    lines.append(f"  • {alert['title']}")
-                lines.append("")
-            
-            if info_alerts:
-                lines.append("🔵 【提示】")
-                for alert in info_alerts:
-                    lines.append(f"  • {alert['title']}")
-            
+
             message = '\n'.join(lines)
             
             # 发送通知
             # 使用危险级别发送最高优先级预警
-            if danger_alerts:
+            if has_danger:
                 subject = "⚠️ 新闻流量危险预警"
             else:
                 subject = "📊 新闻流量预警通知"

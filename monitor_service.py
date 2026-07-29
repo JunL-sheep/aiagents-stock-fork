@@ -805,10 +805,10 @@ class StockMonitorService:
         try:
             from news_flow_db import NewsFlowDatabase
             db = NewsFlowDatabase()
-            # news_flow_db.get_alerts 接受 since 参数；时间窗由 self._news_flow_window_hours 控制
-            since = f'-{self._news_flow_window_hours} hours'
+            # get_alerts 使用 days 参数(整数)；把 hours 换算成天数(向上取整确保覆盖)
+            alert_days = max(1, (self._news_flow_window_hours + 23) // 24)
             if hasattr(db, 'get_alerts'):
-                all_alerts = db.get_alerts(since=since)
+                all_alerts = db.get_alerts(days=alert_days)
             else:
                 all_alerts = db.get_unnotified_alerts()
             alerts = [a for a in all_alerts if a.get('alert_level') in ('danger', 'warning')]
