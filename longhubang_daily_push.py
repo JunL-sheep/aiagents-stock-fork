@@ -32,7 +32,10 @@ def load_config():
 def build_dingtalk_message(result: dict) -> str:
     """
     把 run_comprehensive_analysis 的完整结果拼成钉钉 markdown 消息。
-    尽可能详细展示所有分析维度。
+
+    格式要点（手机端优化）：
+    - 关键数据用要点，不用宽表格
+    - AI 分析去冗取精，仅保留结论性内容
     """
     lines = []
     ts = result.get('timestamp', datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
@@ -42,7 +45,6 @@ def build_dingtalk_message(result: dict) -> str:
 
     data_info = result.get('data_info', {})
     summary = data_info.get('summary', {})
-    final_report = result.get('final_report', {})
     agents = result.get('agents_analysis', {})
     recommended = result.get('recommended_stocks', [])
     scoring = result.get('scoring_ranking', [])
@@ -52,150 +54,132 @@ def build_dingtalk_message(result: dict) -> str:
     lines.append("")
     lines.append("### 📈 一、数据概览")
     lines.append("")
-    data_overview = final_report.get('data_overview', {})
-    lines.append(f"| 指标 | 数值 |")
-    lines.append(f"|------|------|")
-    lines.append(f"| 龙虎榜记录数 | {data_overview.get('total_records', 0)} 条 |")
-    lines.append(f"| 涉及个股 | {data_overview.get('total_stocks', 0)} 只 |")
-    lines.append(f"| 活跃游资 | {data_overview.get('total_youzi', 0)} 个 |")
-    lines.append(f"| 净买入总额 | {data_overview.get('total_net_inflow', 0):,.2f} 元 |")
-    lines.append(f"| 推荐股票 | {data_overview.get('recommended_stocks_count', 0)} 只 |")
+    lines.append(f"🔹 **记录**: {summary.get('total_records', 0)} 条  |  **个股**: {summary.get('total_stocks', 0)} 只")
+    lines.append(f"🔹 **净买入**: {summary.get('total_net_inflow', 0)/1e8:.2f} 亿")
+    lines.append(f"🔹 **推荐股票**: {len(recommended)} 只")
     lines.append("")
 
-    # ==================== 二、AI 评分排名 TOP10 ====================
+    # ==================== 二、评分排名（改用简洁要点）====================
     lines.append("---")
     lines.append("")
-    lines.append("### 🏆 二、AI 智能评分排名 TOP10")
+    lines.append("### 🏆 二、AI 评分排名 TOP10")
     lines.append("")
     if scoring:
-        lines.append("| 排名 | 股票 | 评分 | 净流入(万) | 游资关注度 |")
-        lines.append("|------|------|------|-----------|-----------|")
         for i, s in enumerate(scoring[:10], 1):
-            code = s.get('gpdm', s.get('stock_code', ''))
-            name = s.get('gpmc', s.get('stock_name', ''))
-            score = s.get('total_score', s.get('score', 0))
-            net = s.get('net_inflow', 0) / 10000  # 转万元
-            youzi = s.get('youzi_count', s.get('youzi_score', 0))
-            lines.append(f"| {i} | {name}({code}) | {score} | {net:.1f} | {youzi} |")
+            name = s.get('股票名称', '?')
+            code = s.get('股票代码', '')
+            score = s.get('综合评分', 0)
+            net = s.get('净流入', 0)
+            medal = {1:'🥇', 2:'🥈', 3:'🥉'}.get(i, f'{i}.')
+            lines.append(f"  {medal} **{name}** ({code})  — 评分 {score}  净流入 {net/1e8:.2f}亿")
         lines.append("")
     else:
-        lines.append("（评分数据暂不可用）")
+        lines.append("  （评分数据暂不可用）")
         lines.append("")
 
     # ==================== 三、推荐股票 ====================
     lines.append("---")
     lines.append("")
-    lines.append("### ⭐ 三、精选推荐（Top 10）")
+    lines.append("### ⭐ 三、精选推荐")
     lines.append("")
     if recommended:
-        lines.append("| # | 股票 | 净流入 | 置信度 | 依据 |")
-        lines.append("|---|------|--------|--------|------|")
         for i, s in enumerate(recommended[:10], 1):
             code = s.get('code', '')
             name = s.get('name', '')
-            inflow = s.get('net_inflow', 0) / 1e8  # 转亿
+            inflow = s.get('net_inflow', 0) / 1e8
             conf = s.get('confidence', '中')
-            reason = s.get('reason', '')[:40]
-            lines.append(f"| {i} | **{name}** ({code}) | {inflow:.2f}亿 | {conf} | {reason} |")
+            emoji = {1:'🥇', 2:'🥈', 3:'🥉'}.get(i, '🔹')
+            lines.append(f"  {emoji} **{name}** ({code})  {inflow:.2f}亿  置信度 {conf}")
         lines.append("")
     else:
-        lines.append("（暂无推荐股票）")
+        lines.append("  （暂无推荐股票）")
         lines.append("")
 
-    # ==================== 四、游资行为分析 ====================
-    youzi_analysis = agents.get('youzi', {})
-    youzi_text = youzi_analysis.get('analysis', '')
-    if youzi_text:
+    # ==================== 四、AI 分析师结论（去推理过程）====================
+    # 每个分析师只取关键结论段，去掉漫长的推理过程
+    ai_sections = [
+        ('🎯', '游资行为', agents.get('youzi', {}).get('analysis', '')),
+        ('💎', '个股潜力', agents.get('stock', {}).get('analysis', '')),
+        ('🔥', '题材追踪', agents.get('theme', {}).get('analysis', '')),
+        ('⚠️', '风险控制', agents.get('risk', {}).get('analysis', '')),
+        ('🧠', '首席策略', agents.get('chief', {}).get('analysis', '')),
+    ]
+
+    for emoji, label, text in ai_sections:
+        if not text:
+            continue
         lines.append("---")
         lines.append("")
-        lines.append("### 🎯 四、游资行为分析")
+        lines.append(f"### {emoji} {label}")
+
+        # 去掉推理过程（从【推理过程】到第一个 ### 或 --- 之间的内容）
+        clean = _strip_reasoning(text)
+
+        # 只取前 600 字符的核心结论
+        if len(clean) > 600:
+            clean = clean[:600] + "\n\n  ...（更多内容在完整报告中）"
         lines.append("")
-        # 截取关键内容，钉钉markdown有长度限制
-        youzi_excerpt = youzi_text[:2000]
-        lines.append(youzi_excerpt)
+        lines.append(clean)
         lines.append("")
 
-        # 活跃游资TOP
-        top_youzi = summary.get('top_youzi', {})
-        if top_youzi:
-            lines.append("**活跃游资 TOP10**")
-            lines.append("")
-            lines.append("| 排名 | 游资 | 净买入额(万) |")
-            lines.append("|------|------|-------------|")
-            for i, (name, amount) in enumerate(
-                sorted(top_youzi.items(), key=lambda x: x[1], reverse=True)[:10], 1
-            ):
-                lines.append(f"| {i} | {name} | {amount/10000:.1f} |")
-            lines.append("")
-
-    # ==================== 五、个股潜力分析 ====================
-    stock_analysis = agents.get('stock', {})
-    stock_text = stock_analysis.get('analysis', '')
-    if stock_text:
+    # ==================== 五、上榜类型分布 ====================
+    top_youzi = summary.get('top_youzi', {})
+    if top_youzi:
         lines.append("---")
         lines.append("")
-        lines.append("### 💎 五、个股潜力分析")
+        lines.append("### 📋 上榜类型分布（净买入 TOP）")
         lines.append("")
-        lines.append(stock_text[:2000])
+        for i, (name, amount) in enumerate(
+            sorted(top_youzi.items(), key=lambda x: x[1], reverse=True)[:8], 1
+        ):
+            lines.append(f"  {i}. {name}: {amount/1e8:.2f}亿")
         lines.append("")
 
-    # ==================== 六、题材追踪分析 ====================
-    theme_analysis = agents.get('theme', {})
-    theme_text = theme_analysis.get('analysis', '')
-    if theme_text:
+    # ==================== 六、摘要 ====================
+    summary_text = result.get('final_report', {}).get('summary', '')
+    if summary_text:
         lines.append("---")
         lines.append("")
-        lines.append("### 🔥 六、题材追踪分析")
-        lines.append("")
-        lines.append(theme_text[:1500])
+        lines.append(f"**📝 核心摘要**: {summary_text}")
         lines.append("")
 
-    # ==================== 七、风险控制 ====================
-    risk_analysis = agents.get('risk', {})
-    risk_text = risk_analysis.get('analysis', '')
-    if risk_text:
-        lines.append("---")
-        lines.append("")
-        lines.append("### ⚠️ 七、风险控制")
-        lines.append("")
-        # 风险分析重点关注"风险提示"段
-        risk_idx = risk_text.find('风险提示')
-        if risk_idx >= 0:
-            lines.append(risk_text[risk_idx:risk_idx+1000])
-        else:
-            lines.append(risk_text[:1000])
-        lines.append("")
-
-    # ==================== 八、首席策略 ====================
-    chief_analysis = agents.get('chief', {})
-    chief_text = chief_analysis.get('analysis', '')
-    if chief_text:
-        lines.append("---")
-        lines.append("")
-        lines.append("### 🧠 八、首席策略师综合判断")
-        lines.append("")
-        lines.append(chief_text[:2000])
-        lines.append("")
-
-    # ==================== 九、最终总结 ====================
-    lines.append("---")
-    lines.append("")
-    lines.append(f"**📝 摘要**: {final_report.get('summary', '')}")
-    lines.append("")
     lines.append("---")
     lines.append(f"_智瞰龙虎自动生成 | {ts}_")
 
     return '\n'.join(lines)
 
 
-def push_to_dingtalk(webhook_url: str, keyword: str, content: str) -> tuple:
+def _strip_reasoning(text: str) -> str:
+    """
+    去掉 AI 分析文本中的推理过程部分，保留核心分析结论。
+    """
+    import re
+    # 去掉【推理过程】...到下一个标题/空行之间的内容
+    text = re.sub(r'【推理过程】.*?(\n###|\n\*\*核心|\n———|\Z)', r'\1', text, flags=re.DOTALL)
+    # 去掉开头的"嗯，用户"等推理叙述段落（到第一个换行符前）
+    text = re.sub(r'^嗯.*?。\n\n', '', text, flags=re.DOTALL)
+    text = re.sub(r'^.*?(?=好的，|各位投资者|首先，|【|###)', '', text, flags=re.DOTALL)
+    # 去掉 AI 输出中的 markdown 分隔线（避免与消息自身的 --- 混淆）
+    text = re.sub(r'\n---+\n', '\n\n', text)
+    # 去掉表格（手机端显示差，只保留关键结论）
+    text = re.sub(r'\|[^\n]+\|[^\n]*\n\|[:\-\s|]+\|[^\n]*(\n\|[^\n]+\|)*', '', text)
+    # 清理多余空行
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    return text.strip()
+
+
+def push_to_dingtalk(webhook_url: str, content: str) -> tuple:
     """推送钉钉 markdown"""
     import requests
+    # 确保消息正文包含关键字（钉钉安全校验：关键词=龙虎榜分析）
+    safe_content = content
+    if '龙虎榜分析' not in content:
+        safe_content = f"### 龙虎榜分析\n\n{content}"
     data = {
         "msgtype": "markdown",
         "markdown": {
-            "title": f"{keyword} - 盘后龙虎榜全量报告",
-            "text": content,
+            "title": "龙虎榜分析 - 盘后龙虎榜全量报告",
+            "text": safe_content,
         }
     }
     r = requests.post(webhook_url, json=data, headers={'Content-Type': 'application/json'}, timeout=15)
@@ -230,7 +214,8 @@ def main():
     from longhubang_engine import LonghubangEngine
     engine = LonghubangEngine()
 
-    target_date = args.date or (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
+    # 默认使用今天（盘后19:00运行，当日龙虎榜已出）
+    target_date = args.date or datetime.now().strftime('%Y-%m-%d')
     print(f'📅 分析目标: {target_date}（过去 {args.days} 天）')
 
     result = engine.run_comprehensive_analysis(date=target_date, days=args.days)
@@ -266,7 +251,6 @@ def main():
     print(f'\n📤 推送到龙虎榜专用机器人...')
     ok, msg = push_to_dingtalk(
         cfg['longhubang_webhook_url'],
-        cfg['webhook_keyword'],
         content
     )
     if not ok:
