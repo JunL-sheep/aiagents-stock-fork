@@ -120,6 +120,52 @@ def extract_strategy_summary(agents):
     return summary
 
 
+def build_overseas_section() -> str:
+    """
+    拉取隔夜外盘行情（美股指数/AI头部公司/韩股半导体），拼成 markdown 段。
+    出错时降级返回空字符串，不影响主简报。
+    """
+    try:
+        from overseas_market_fetcher import fetch_overseas_snapshot, format_overseas_snapshot_md
+        data = fetch_overseas_snapshot(stock_delay=1.0)
+        md = format_overseas_snapshot_md(data)
+
+        # 生成一句 AI 简评（基于涨跌数据）
+        all_items = data.get('indices', []) + data.get('ai_stocks', []) + data.get('kr_semicon', [])
+        if all_items:
+            down_ai = [s for s in data.get('ai_stocks', []) if s.get('change_pct', 0) < -5]
+            down_kr = [s for s in data.get('kr_semicon', []) if s.get('change_pct', 0) < -5]
+            up_big = [s for s in all_items if s.get('change_pct', 0) > 2]
+
+            parts = []
+            if down_ai:
+                names = '、'.join(s['name'] for s in down_ai[:3])
+                avg = sum(s.get('change_pct', 0) for s in down_ai) / len(down_ai)
+                parts.append(f"美股AI板块走弱（{names}等跌幅{avg:.1f}%）")
+            if down_kr:
+                names = '、'.join(s['name'] for s in down_kr[:2])
+                parts.append(f"韩股半导体承压（{names}跌幅显著）")
+            if up_big:
+                names = '、'.join(s['name'] for s in up_big[:2])
+                avg = sum(s.get('change_pct', 0) for s in up_big) / len(up_big)
+                parts.append(f"少数个股逆势走强（{names}涨{avg:.1f}%）")
+
+            # 指数方向
+            indices = data.get('indices', [])
+            if indices:
+                avg_idx = sum(i.get('change_pct', 0) for i in indices) / len(indices)
+                direction = "偏弱震荡" if avg_idx < -0.3 else ("小幅走高" if avg_idx > 0.3 else "窄幅整理")
+
+            if parts:
+                summary = f"> **简评**: 隔夜{'；'.join(parts)}。美股三大指数{direction}，\n> 今日A股AI/半导体板块开盘可能承压，注意仓位控制。"
+                md += summary + "\n"
+
+        return md
+    except Exception as e:
+        print(f"⚠️ 隔夜外盘数据获取失败: {e}")
+        return ""
+
+
 def build_news_flow_section():
     """
     从 news_flow.db 拉板块级 AI 分析，拼成 markdown 段。
@@ -192,7 +238,7 @@ def build_news_flow_section():
     return "\n".join(lines)
 
 
-def build_dingtalk_message(report, top5, quotes, cfg, news_flow_md=""):
+def build_dingtalk_message(report, top5, quotes, cfg, news_flow_md="", overseas_md=""):
     """拼成钉钉 markdown 消息"""
     recs = report['recommended_stocks']
     if not recs:
@@ -265,6 +311,11 @@ def build_dingtalk_message(report, top5, quotes, cfg, news_flow_md=""):
     # 新闻流量分析 (板块级) - 来自 news_flow 模块
     if news_flow_md:
         lines.append(news_flow_md)
+        lines.append("")
+
+    # 隔夜外盘速览
+    if overseas_md:
+        lines.append(overseas_md)
         lines.append("")
 
     lines.append("---")
@@ -393,10 +444,12 @@ def main():
     quotes = fetch_realtime_quotes(codes)
     print(f'💰 拉取 {len(quotes)}/{len(codes)} 只实时价')
 
-    # 4) 拼消息 (含 news_flow 板块级分析)
+    # 4) 拼消息 (含 news_flow 板块级分析 + 隔夜外盘)
     print('🌊 拉取 news_flow 板块级分析...')
     news_flow_md = build_news_flow_section()
-    content = build_dingtalk_message(report, top5, quotes, cfg, news_flow_md=news_flow_md)
+    print('🌍 拉取隔夜外盘行情...')
+    overseas_md = build_overseas_section()
+    content = build_dingtalk_message(report, top5, quotes, cfg, news_flow_md=news_flow_md, overseas_md=overseas_md)
     if not content:
         print('❌ 推荐股列表为空')
         return 1
