@@ -1,3 +1,6 @@
+# Generated reports
+/reports/
+
 /*.rar
 /test_akshare.py
 /test_fixed.py

@@ -29,13 +29,10 @@ def load_config():
     }
 
 
-def build_dingtalk_message(result: dict) -> str:
+def build_dingtalk_message(result: dict, html_path: str = '') -> str:
     """
-    把 run_comprehensive_analysis 的完整结果拼成钉钉 markdown 消息。
-
-    格式要点（手机端优化）：
-    - 关键数据用要点，不用宽表格
-    - AI 分析去冗取精，仅保留结论性内容
+    生成 DingTalk 推送用的摘要消息。
+    完整内容请查看生成的 HTML 报告。
     """
     lines = []
     ts = result.get('timestamp', datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
@@ -45,127 +42,54 @@ def build_dingtalk_message(result: dict) -> str:
 
     data_info = result.get('data_info', {})
     summary = data_info.get('summary', {})
-    agents = result.get('agents_analysis', {})
     recommended = result.get('recommended_stocks', [])
     scoring = result.get('scoring_ranking', [])
 
-    # ==================== 一、数据概览 ====================
-    lines.append("---")
-    lines.append("")
-    lines.append("### 📈 一、数据概览")
-    lines.append("")
-    lines.append(f"🔹 **记录**: {summary.get('total_records', 0)} 条  |  **个股**: {summary.get('total_stocks', 0)} 只")
-    lines.append(f"🔹 **净买入**: {summary.get('total_net_inflow', 0)/1e8:.2f} 亿")
-    lines.append(f"🔹 **推荐股票**: {len(recommended)} 只")
+    # 数据概览
+    net_inflow = summary.get('total_net_inflow', 0)
+    inflow_emoji = '🔴' if net_inflow >= 0 else '🟢'
+    lines.append(f"📈 **{summary.get('total_records', 0)}** 条记录  |  **{summary.get('total_stocks', 0)}** 只个股  |  🎯 **{summary.get('total_youzi', 0)}** 游资")
+    lines.append(f"{inflow_emoji} **净买入**: {abs(net_inflow)/1e8:.2f}亿{'（净流入）' if net_inflow >= 0 else '（净流出）'}")
     lines.append("")
 
-    # ==================== 二、评分排名（改用简洁要点）====================
-    lines.append("---")
-    lines.append("")
-    lines.append("### 🏆 二、AI 评分排名 TOP10")
-    lines.append("")
+    # 评分排名 TOP5
     if scoring:
-        for i, s in enumerate(scoring[:10], 1):
+        lines.append("**🏆 评分 TOP5**")
+        for i, s in enumerate(scoring[:5], 1):
             name = s.get('股票名称', '?')
             code = s.get('股票代码', '')
             score = s.get('综合评分', 0)
             net = s.get('净流入', 0)
             medal = {1:'🥇', 2:'🥈', 3:'🥉'}.get(i, f'{i}.')
-            lines.append(f"  {medal} **{name}** ({code})  — 评分 {score}  净流入 {net/1e8:.2f}亿")
-        lines.append("")
-    else:
-        lines.append("  （评分数据暂不可用）")
+            lines.append(f"  {medal} {name}({code})  评分 {score}  净流入 {net/1e8:.2f}亿")
         lines.append("")
 
-    # ==================== 三、推荐股票 ====================
-    lines.append("---")
-    lines.append("")
-    lines.append("### ⭐ 三、精选推荐")
-    lines.append("")
+    # 推荐 TOP5
     if recommended:
-        for i, s in enumerate(recommended[:10], 1):
-            code = s.get('code', '')
+        lines.append("**⭐ 推荐 TOP5**")
+        for i, s in enumerate(recommended[:5], 1):
             name = s.get('name', '')
+            code = s.get('code', '')
             inflow = s.get('net_inflow', 0) / 1e8
-            conf = s.get('confidence', '中')
-            emoji = {1:'🥇', 2:'🥈', 3:'🥉'}.get(i, '🔹')
-            lines.append(f"  {emoji} **{name}** ({code})  {inflow:.2f}亿  置信度 {conf}")
-        lines.append("")
-    else:
-        lines.append("  （暂无推荐股票）")
+            medal = {1:'🥇', 2:'🥈', 3:'🥉'}.get(i, '🔹')
+            lines.append(f"  {medal} {name}({code})  {inflow:.2f}亿")
         lines.append("")
 
-    # ==================== 四、AI 分析师结论（去推理过程）====================
-    # 每个分析师只取关键结论段，去掉漫长的推理过程
-    ai_sections = [
-        ('🎯', '游资行为', agents.get('youzi', {}).get('analysis', '')),
-        ('💎', '个股潜力', agents.get('stock', {}).get('analysis', '')),
-        ('🔥', '题材追踪', agents.get('theme', {}).get('analysis', '')),
-        ('⚠️', '风险控制', agents.get('risk', {}).get('analysis', '')),
-        ('🧠', '首席策略', agents.get('chief', {}).get('analysis', '')),
-    ]
-
-    for emoji, label, text in ai_sections:
-        if not text:
-            continue
+    # 完整报告入口
+    if html_path:
         lines.append("---")
         lines.append("")
-        lines.append(f"### {emoji} {label}")
-
-        # 去掉推理过程（从【推理过程】到第一个 ### 或 --- 之间的内容）
-        clean = _strip_reasoning(text)
-
-        # 只取前 600 字符的核心结论
-        if len(clean) > 600:
-            clean = clean[:600] + "\n\n  ...（更多内容在完整报告中）"
-        lines.append("")
-        lines.append(clean)
-        lines.append("")
-
-    # ==================== 五、上榜类型分布 ====================
-    top_youzi = summary.get('top_youzi', {})
-    if top_youzi:
-        lines.append("---")
-        lines.append("")
-        lines.append("### 📋 上榜类型分布（净买入 TOP）")
-        lines.append("")
-        for i, (name, amount) in enumerate(
-            sorted(top_youzi.items(), key=lambda x: x[1], reverse=True)[:8], 1
-        ):
-            lines.append(f"  {i}. {name}: {amount/1e8:.2f}亿")
-        lines.append("")
-
-    # ==================== 六、摘要 ====================
-    summary_text = result.get('final_report', {}).get('summary', '')
-    if summary_text:
-        lines.append("---")
-        lines.append("")
-        lines.append(f"**📝 核心摘要**: {summary_text}")
+        lines.append(f"📄 **完整报告已生成**")
+        lines.append(f"```")
+        lines.append(f"{html_path}")
+        lines.append(f"```")
+        lines.append(f"双击打开即可查看全部 5 位 AI 分析师的完整分析内容。")
         lines.append("")
 
     lines.append("---")
     lines.append(f"_智瞰龙虎自动生成 | {ts}_")
 
     return '\n'.join(lines)
-
-
-def _strip_reasoning(text: str) -> str:
-    """
-    去掉 AI 分析文本中的推理过程部分，保留核心分析结论。
-    """
-    import re
-    # 去掉【推理过程】...到下一个标题/空行之间的内容
-    text = re.sub(r'【推理过程】.*?(\n###|\n\*\*核心|\n———|\Z)', r'\1', text, flags=re.DOTALL)
-    # 去掉开头的"嗯，用户"等推理叙述段落（到第一个换行符前）
-    text = re.sub(r'^嗯.*?。\n\n', '', text, flags=re.DOTALL)
-    text = re.sub(r'^.*?(?=好的，|各位投资者|首先，|【|###)', '', text, flags=re.DOTALL)
-    # 去掉 AI 输出中的 markdown 分隔线（避免与消息自身的 --- 混淆）
-    text = re.sub(r'\n---+\n', '\n\n', text)
-    # 去掉表格（手机端显示差，只保留关键结论）
-    text = re.sub(r'\|[^\n]+\|[^\n]*\n\|[:\-\s|]+\|[^\n]*(\n\|[^\n]+\|)*', '', text)
-    # 清理多余空行
-    text = re.sub(r'\n{3,}', '\n\n', text)
-    return text.strip()
 
 
 def push_to_dingtalk(webhook_url: str, content: str) -> tuple:
@@ -230,24 +154,25 @@ def main():
           f'{result["data_info"]["summary"].get("total_stocks", 0)} 只股票')
     print(f'   ⭐ 推荐: {len(result.get("recommended_stocks", []))} 只股票')
 
-    # 2) 构建消息
-    print('\n📝 构建推送消息...')
-    content = build_dingtalk_message(result)
+    # 2) 生成 HTML 完整报告
+    print('\n📄 生成 HTML 完整报告...')
+    from longhubang_report_html import generate_html_report
+    html_path = generate_html_report(result)
+
+    # 3) 构建 DingTalk 摘要消息
+    print('📝 构建推送摘要...')
+    content = build_dingtalk_message(result, html_path=html_path)
 
     if args.dry_run:
         print()
         print('=' * 60)
         print('【DRY-RUN 模式】以下是钉钉将收到的内容:')
         print('=' * 60)
-        # 只打印前5000字符避免刷屏
-        if len(content) > 5000:
-            print(content[:5000])
-            print(f'\n...（共 {len(content)} 字符，已截断）')
-        else:
-            print(content)
+        print(content)
+        print(f'\n📄 完整报告: {html_path}')
         return 0
 
-    # 3) 推送
+    # 4) 推送
     print(f'\n📤 推送到龙虎榜专用机器人...')
     ok, msg = push_to_dingtalk(
         cfg['longhubang_webhook_url'],
@@ -257,10 +182,6 @@ def main():
         print(f'❌ {msg}')
         return 1
     print(f'✅ {msg}')
-
-    # 钉钉单条消息限制约 20000 字符，超长时告警
-    if len(content) > 18000:
-        print(f'⚠️ 消息长度 {len(content)} 字符，接近钉钉限制，部分渠道可能截断')
 
     return 0
 
