@@ -20,6 +20,7 @@ import json
 import sqlite3
 import argparse
 from datetime import datetime
+from typing import Optional
 from dotenv import load_dotenv
 import requests
 
@@ -57,24 +58,65 @@ def get_latest_report():
     }
 
 
+def _fetch_close_from_kline(code: str) -> Optional[float]:
+    """降级：从 TDX 日 K 线取最近一根有效收盘价（昨收或最后一笔成交价）。
+
+    实时报价不可用（TDX 未就绪/盘前无价）时作为 fallback。
+    TDX 日 K 线返回升序（旧→新），最新数据在末尾。
+    """
+    tdx = os.getenv('TDX_BASE_URL', 'http://localhost:9999')
+    try:
+        r = requests.get(f'{tdx}/api/kline', params={'code': code, 'type': 'day'}, timeout=5)
+        data = r.json()
+        if data.get('code') != 0:
+            return None
+        items = data.get('data', {}).get('List', [])
+        if not items:
+            return None
+        # 升序排列，从末尾倒序遍历取最近一根 Close > 0 的值
+        for item in reversed(items):
+            close_raw = item.get('Close', 0)
+            if close_raw > 0:
+                return close_raw / 1000.0
+        return None
+    except Exception:
+        return None
+
+
 def fetch_realtime_quotes(codes):
-    """通过 TDX 拉当前价（用于盘前预测时的参考价）"""
+    """通过 TDX 拉当前价（用于盘前预测时的参考价）。
+
+    实时价不可用时自动降级到日 K 线昨收价，确保监测池注入不因盘前 TDX 未就绪而跳过。
+    """
     quotes = {}
     tdx = os.getenv('TDX_BASE_URL', 'http://localhost:9999')
     for code in codes:
+        price = None
         try:
             r = requests.get(f'{tdx}/api/quote', params={'code': code}, timeout=5)
             data = r.json()
             if data.get('code') == 0 and data.get('data'):
                 k = data['data'][0]['K']
+                price = k['Close'] / 1000
                 quotes[code] = {
-                    'price': k['Close'] / 1000,
+                    'price': price,
                     'open': k['Open'] / 1000,
                     'high': k['High'] / 1000,
                     'low': k['Low'] / 1000,
                 }
         except Exception as e:
-            quotes[code] = {'error': str(e)}
+            print(f"  ⚠️ {code} 实时价拉取失败: {str(e)[:50]}, 尝试 K 线降级")
+
+        # 实时价不可用（未取到或为 0）→ 降级到日 K 线昨收
+        if not price:
+            close = _fetch_close_from_kline(code)
+            if close:
+                print(f"  ↪ {code} K 线降级成功: 昨收 {close}")
+                quotes[code] = {'price': close}
+            else:
+                print(f"  ❌ {code} 实时价/K 线均不可用")
+                quotes[code] = {'error': 'price_unavailable'}
+
     return quotes
 
 
