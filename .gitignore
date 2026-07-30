@@ -1,5 +1,6 @@
 # Generated reports
 /reports/
+.report_server.pid
 
 /*.rar
 /test_akshare.py
