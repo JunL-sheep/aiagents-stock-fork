@@ -75,16 +75,23 @@ def build_dingtalk_message(result: dict, html_path: str = '') -> str:
             lines.append(f"  {medal} {name}({code})  {inflow:.2f}亿")
         lines.append("")
 
-    # 完整报告入口
+    # 完整报告入口（通过 HTTP 服务器访问，手机/PC 均可）
     if html_path:
         lines.append("---")
         lines.append("")
-        lines.append(f"📄 **完整报告已生成**")
-        lines.append(f"```")
-        lines.append(f"{html_path}")
-        lines.append(f"```")
-        lines.append(f"双击打开即可查看全部 5 位 AI 分析师的完整分析内容。")
-        lines.append("")
+        lines.append(f"📄 **完整报告**  👇 点击查看全部 5 位 AI 分析师的完整分析")
+        try:
+            from report_server import get_server_url, ensure_running
+            ensure_running()
+            report_name = os.path.basename(html_path)
+            url = get_server_url(report_name)
+            lines.append(f"[🔗 点击打开完整报告]({url})")
+            lines.append("")
+            lines.append(f"⚠️ 请确保手机/电脑在同一 WiFi 网络下")
+        except Exception:
+            # 降级：直接显示本地路径
+            lines.append(f"  本地路径: `{html_path}`")
+            lines.append("")
 
     lines.append("---")
     lines.append(f"_智瞰龙虎自动生成 | {ts}_")
